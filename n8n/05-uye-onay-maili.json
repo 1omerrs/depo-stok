@@ -1,0 +1,50 @@
+{
+  "id": "depoUyeOnay01",
+  "name": "Depo - Üye ol formu",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "depo-uye-ol",
+        "formTitle": "Üye ol",
+        "formDescription": "İsim, soyisim, e-posta ve şirket adı sitedeki üye ol formuyla aynı gelir.",
+        "formFields": {
+          "values": [
+            { "fieldLabel": "İsim", "fieldType": "text", "requiredField": true },
+            { "fieldLabel": "Soyisim", "fieldType": "text", "requiredField": true },
+            { "fieldLabel": "E-posta", "fieldType": "email", "requiredField": true },
+            { "fieldLabel": "Şirket adı", "fieldType": "text", "requiredField": true }
+          ]
+        },
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "a1b2c3d4-0005-4000-8000-000000000001",
+      "name": "Üye ol formu",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.2,
+      "position": [240, 300],
+      "webhookId": "depo-uye-ol"
+    },
+    {
+      "parameters": {
+        "fromEmail": "depo@example.com",
+        "toEmail": "={{ $json['E-posta'] }}",
+        "subject": "Depo paneli üyelik talebiniz alındı",
+        "emailFormat": "text",
+        "text": "={{ 'Merhaba ' + $json['İsim'] + ' ' + $json['Soyisim'] + ',\\n\\n' + $json['Şirket adı'] + ' adına üyelik talebiniz alındı. Yönetici onayından sonra giriş yapabilirsiniz.' }}",
+        "options": {}
+      },
+      "id": "a1b2c3d4-0005-4000-8000-000000000002",
+      "name": "Talep maili",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [560, 300]
+    }
+  ],
+  "connections": {
+    "Üye ol formu": {"main": [[{"node": "Talep maili", "type": "main", "index": 0}]]}
+  },
+  "active": false,
+  "settings": {"executionOrder": "v1"},
+  "meta": {"templateCredsSetupCompleted": false}
+}
