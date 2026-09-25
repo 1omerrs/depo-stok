@@ -1,0 +1,60 @@
+{
+  "name": "Depo - İade talebi",
+  "nodes": [
+    {
+      "parameters": {"httpMethod": "POST", "path": "depo-return", "responseMode": "responseNode", "options": {}},
+      "id": "a1b2c3d4-0004-4000-8000-000000000001",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://127.0.0.1:8000/api/webhooks/returns",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {}
+      },
+      "id": "a1b2c3d4-0004-4000-8000-000000000002",
+      "name": "Isle",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [500, 300]
+    },
+    {
+      "parameters": {
+        "fromEmail": "depo@example.com",
+        "toEmail": "={{ $('Isle').item.json.data.notification.to }}",
+        "subject": "={{ $('Isle').item.json.data.notification.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $('Isle').item.json.data.notification.body }}",
+        "options": {}
+      },
+      "id": "a1b2c3d4-0004-4000-8000-000000000003",
+      "name": "E-posta",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [760, 200],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {"respondWith": "json", "responseBody": "={{ $('Isle').item.json }}", "options": {}},
+      "id": "a1b2c3d4-0004-4000-8000-000000000004",
+      "name": "Yanit",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1020, 300]
+    }
+  ],
+  "connections": {
+    "Webhook": {"main": [[{"node": "Isle", "type": "main", "index": 0}]]},
+    "Isle": {"main": [[{"node": "E-posta", "type": "main", "index": 0}]]},
+    "E-posta": {"main": [[{"node": "Yanit", "type": "main", "index": 0}]]}
+  },
+  "active": false,
+  "settings": {"executionOrder": "v1"},
+  "meta": {"templateCredsSetupCompleted": false}
+}
