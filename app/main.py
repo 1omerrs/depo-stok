@@ -46,6 +46,8 @@ def create_app() -> FastAPI:
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
     @app.get("/")
+    @app.get("/giris")
+    @app.get("/uye-ol")
     @app.get("/yonetim")
     def index():
         return FileResponse(STATIC / "index.html")

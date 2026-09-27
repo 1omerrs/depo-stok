@@ -32,12 +32,16 @@ def canonicalize_source(value: str | None) -> str:
     return SOURCES[key]
 
 
-def normalize(payload: dict, source: str | None = None) -> list[IncomingLine]:
+def normalize(payload: dict, source: str | None = None, *, open_source: bool = False) -> list[IncomingLine]:
     if not isinstance(payload, dict):
         raise PayloadError("Sipariş gövdesi nesne olmalı")
-    forced = canonicalize_source(source) if source else None
-    raw_source = forced or _first(payload, ("source", "channel", "platform"))
-    channel = forced or canonicalize_source(str(raw_source or ""))
+    if open_source:
+        raw_source = source or _first(payload, ("source", "channel", "platform")) or "Sipariş"
+        channel = str(raw_source).strip()[:40] or "Sipariş"
+    else:
+        forced = canonicalize_source(source) if source else None
+        raw_source = forced or _first(payload, ("source", "channel", "platform"))
+        channel = forced or canonicalize_source(str(raw_source or ""))
     order_id = str(_first(payload, ORDER_ID_KEYS) or "").strip()
     if not order_id:
         raise PayloadError("Sipariş numarası gerekli")

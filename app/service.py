@@ -4,11 +4,14 @@ import logging
 import re
 import secrets
 import uuid
+from datetime import datetime, timezone
 
 import httpx
 
+from app.channels import ChannelError, channel_by_code, CHANNELS, pull_trendyol
 from app.config import Settings
 from app.matching import Matcher
+from app.secretbox import open_sealed, seal
 from app.models import Account, IncomingLine, Location, Order, Product, ReturnRequest, StockError
 from app.passwords import hash_password, verify_password
 from app.results import Leave, Result
@@ -42,7 +45,7 @@ class WarehouseService:
         self.settings = settings
         self.matcher = matcher
 
-    def ingest_order(self, line: IncomingLine) -> Result:
+    def ingest_order(self, line: IncomingLine, owner: str = "") -> Result:
         def op():
             existing = self.store.find_order_by_external(line.external_key)
             if existing:
@@ -65,16 +68,20 @@ class WarehouseService:
                 needs_manual_match=not auto,
                 created_at=now_iso(),
                 updated_at=now_iso(),
+                owner_id=owner,
             )
             if auto and outcome.product:
-                place, note = self._choose(outcome.product.id, line.quantity)
+                place, note = self._choose(outcome.product.id, line.quantity, owner)
                 order.proposed_location_id = place.id if place else None
                 order.stock_note = note
             self.store.save_order(order)
             log.info("sipariş %s %s güven=%s", order.order_id, order.match_method, order.match_confidence)
             return Result(True, "created", "Sipariş kaydedildi", 201, {"order": self._order_view(order), "notification": self._order_notification(order)})
 
-        return self._run(op)
+        result = self._run(op)
+        if result.ok and result.code == "created":
+            self._ping_new_order((result.data or {}).get("order") or {})
+        return result
 
     def confirm_match(self, order_pk: str, product_id: str) -> Result:
         def op():
@@ -93,7 +100,7 @@ class WarehouseService:
             order.match_confidence = 100
             order.match_method = "manual"
             order.needs_manual_match = False
-            place, note = self._choose(product.id, order.quantity)
+            place, note = self._choose(product.id, order.quantity, order.owner_id)
             order.proposed_location_id = place.id if place else None
             order.stock_note = note
             order.updated_at = now_iso()
@@ -119,7 +126,7 @@ class WarehouseService:
             if order.needs_manual_match or not order.matched_product_id:
                 raise Leave(Result(False, "needs_manual_match", "Bu sipariş manuel ürün eşleştirmesi bekliyor", 409, {"order": self._order_view(order)}))
             if not order.proposed_location_id:
-                place, note = self._choose(order.matched_product_id, order.quantity)
+                place, note = self._choose(order.matched_product_id, order.quantity, order.owner_id)
                 order.proposed_location_id = place.id if place else None
                 order.stock_note = note
             if not order.proposed_location_id:
@@ -137,9 +144,14 @@ class WarehouseService:
             order.status = "tamamlandı"
             order.updated_at = now_iso()
             self.store.save_order(order)
-            return Result(True, "completed", "Stok düşüldü, sipariş tamamlandı.", data={"order": self._order_view(order)})
+            new_qty = self.store.get_stock_quantity(order.matched_product_id, location.id)
+            view = self._order_view(order)
+            return Result(True, "completed", "Stok düşüldü, sipariş tamamlandı.", data={"order": view, "stock_after": new_qty})
 
-        return self._run(op)
+        result = self._run(op)
+        if result.ok and result.code == "completed":
+            self._ping_low_stock(result.data or {})
+        return result
 
     def describe_order_token(self, token: str) -> Result:
         order = self.store.get_order_by_token(token)
@@ -329,8 +341,76 @@ class WarehouseService:
         selected.sort(key=lambda row: (row["block"], shelf_key(row["shelf_code"]), row["sku"]))
         return selected
 
-    def list_orders(self, status: str = "", source: str = "") -> list[dict]:
-        rows = [self._order_view(order) for order in self.store.list_orders()]
+    def list_channels(self, owner: str) -> list[dict]:
+        saved = {row["channel"]: row for row in self.store.list_channel_links(owner)}
+        rows = []
+        for spec in CHANNELS:
+            link = saved.get(spec["code"])
+            rows.append(
+                {
+                    "code": spec["code"],
+                    "name": spec["name"],
+                    "mode": spec["mode"],
+                    "live": spec["live"],
+                    "hint": spec["hint"],
+                    "lead": spec.get("lead") or spec["hint"],
+                    "steps": list(spec.get("steps") or ()),
+                    "fields": [dict(item) for item in spec["fields"]],
+                    "connected": link is not None,
+                    "last_error": (link or {}).get("last_error") or "",
+                }
+            )
+        return rows
+
+    def save_channel(self, owner: str, code: str, fields: dict) -> Result:
+        spec = channel_by_code(code)
+        if spec is None or spec["mode"] != "api":
+            return Result(False, "invalid", "Bu kanal buradan bağlanmaz", 400)
+        cleaned = {}
+        for field in spec["fields"]:
+            value = str(fields.get(field["name"]) or "").strip()
+            if not value:
+                return Result(False, "invalid", f"{field['label']} gerekli", 400)
+            cleaned[field["name"]] = value
+        self.store.upsert_channel_link(owner, code, seal(cleaned, self.settings.panel_secret), now_iso())
+        if spec["code"] in {"hepsiburada", "n11", "amazon"}:
+            self._ping_channel(owner, spec["code"], cleaned)
+        if spec["live"]:
+            return Result(True, "connected", f"{spec['name']} bağlandı. Yeni siparişler bu listede görünür.")
+        return Result(True, "stored", f"{spec['name']} bağlantısı kaydedildi.")
+
+    def disconnect_channel(self, owner: str, code: str) -> Result:
+        self.store.delete_channel_link(owner, code)
+        return Result(True, "disconnected", "Bağlantı kaldırıldı")
+
+    def sync_channels(self, owner: str) -> Result:
+        imported = 0
+        notes: list[str] = []
+        for link in self.store.list_channel_links(owner):
+            spec = channel_by_code(link["channel"])
+            if spec is None or not spec["live"] or spec["code"] != "trendyol":
+                continue
+            try:
+                secrets = open_sealed(link["secrets"], self.settings.panel_secret)
+                lines = pull_trendyol(secrets)
+            except (ChannelError, ValueError) as exc:
+                message = exc.message if isinstance(exc, ChannelError) else "Bağlantı bilgisi okunamadı"
+                self.store.touch_channel_link(owner, link["channel"], link.get("last_sync_at"), message)
+                self._ping_channel_error(owner, spec["name"], message)
+                notes.append(message)
+                continue
+            for line in lines:
+                line.external_key = f"{owner}|{line.external_key}"
+                result = self.ingest_order(line, owner)
+                if result.code == "created":
+                    imported += 1
+            self.store.touch_channel_link(owner, link["channel"], now_iso(), None)
+        if notes and imported == 0:
+            return Result(False, "sync_failed", notes[0], 502, {"imported": 0})
+        return Result(True, "synced", f"{imported} yeni sipariş düştü" if imported else "", data={"imported": imported})
+
+    def list_orders(self, status: str = "", source: str = "", owner: str = "") -> list[dict]:
+        rows = [self._order_view(order) for order in self.store.list_orders() if order.owner_id == owner]
         if status:
             rows = [row for row in rows if row["status"] == status]
         if source:
@@ -363,6 +443,7 @@ class WarehouseService:
             password_hash=hash_password(password),
             status="beklemede",
             created_at=now_iso(),
+            intake_key=secrets.token_urlsafe(18),
         )
         self.store.insert_user(account)
         return Result(True, "created", "Üyeliğiniz alındı. Yönetici onayından sonra giriş yapabilirsiniz.", 201, {"account": self._account_view(account)})
@@ -384,7 +465,7 @@ class WarehouseService:
             True,
             "ok",
             "Giriş yapıldı",
-            data={"user": {"role": "member", "id": account.id, "name": f"{account.first_name} {account.last_name}", "email": account.email, "company_name": account.company_name}},
+            data={"user": {"role": "member", "id": account.id, "name": f"{account.first_name} {account.last_name}", "email": account.email, "company_name": account.company_name, "intake_key": account.intake_key}},
         )
 
     def list_members(self) -> list[dict]:
@@ -431,6 +512,87 @@ class WarehouseService:
         account.status = "reddedildi"
         self.store.save_user(account)
         return Result(True, "rejected", "Üyelik reddedildi", data={"account": self._account_view(account)})
+
+    def send_member_message(self, user_id: str, body: str) -> Result:
+        account = self.store.get_user(user_id)
+        if account is None:
+            return Result(False, "not_found", "Üye bulunamadı", 404)
+        text = body.strip()
+        if not text:
+            return Result(False, "invalid", "Mesaj boş olamaz", 400)
+        if len(text) > 500:
+            return Result(False, "invalid", "Mesaj en fazla 500 karakter olsun", 400)
+        self.store.insert_message(str(uuid.uuid4()), account.id, text, now_iso())
+        return Result(True, "sent", f"{account.first_name} {account.last_name} bildirimine düştü", 201)
+
+    def send_support(self, user_id: str, channel: str, body: str) -> Result:
+        account = self.store.get_user(user_id)
+        if account is None:
+            return Result(False, "not_found", "Üye bulunamadı", 404)
+        text = body.strip()
+        if not text:
+            return Result(False, "invalid", "Mesaj boş olamaz", 400)
+        if len(text) > 500:
+            return Result(False, "invalid", "Mesaj en fazla 500 karakter olsun", 400)
+        spec = channel_by_code(channel.strip())
+        label = spec["name"] if spec else channel.strip()[:40]
+        self.store.insert_support(
+            str(uuid.uuid4()),
+            account.id,
+            f"{account.first_name} {account.last_name}",
+            account.email,
+            account.company_name,
+            label,
+            text,
+            now_iso(),
+        )
+        return Result(True, "sent", "Mesajın yönetime ulaştı", 201)
+
+    def list_support(self) -> list[dict]:
+        return self.store.list_support()
+
+    def reply_support(self, message_id: str, body: str) -> Result:
+        note = self.store.get_support(message_id)
+        if note is None:
+            return Result(False, "not_found", "Mesaj bulunamadı", 404)
+        text = body.strip()
+        if not text:
+            return Result(False, "invalid", "Cevap boş olamaz", 400)
+        if len(text) > 500:
+            return Result(False, "invalid", "Cevap en fazla 500 karakter olsun", 400)
+        account = self.store.get_user(note["user_id"])
+        if account is None:
+            return Result(False, "not_found", "Üye silinmiş, cevap iletilemedi", 404)
+        self.store.insert_message(str(uuid.uuid4()), account.id, text, now_iso())
+        self.store.save_support_reply(message_id, text, now_iso())
+        self._post_n8n(
+            self.settings.reply_webhook,
+            {
+                "type": "admin_reply",
+                "to": account.email,
+                "subject": "Depo panelinden cevap",
+                "body": text,
+                "name": f"{account.first_name} {account.last_name}",
+            },
+        )
+        return Result(True, "sent", f"Cevap {account.first_name} {account.last_name} bildirimine düştü", 201)
+
+    def delete_member(self, user_id: str) -> Result:
+        def op():
+            account = self.store.get_user(user_id)
+            if account is None:
+                raise Leave(Result(False, "not_found", "Üye bulunamadı", 404))
+            self.store.delete_member_data(user_id)
+            return Result(True, "deleted", f"{account.first_name} {account.last_name} silindi")
+
+        return self._run(op)
+
+    def list_my_messages(self, user_id: str) -> list[dict]:
+        return self.store.list_messages(user_id)
+
+    def mark_my_messages_seen(self, user_id: str) -> Result:
+        self.store.mark_messages_seen(user_id)
+        return Result(True, "seen", "Bildirimler görüldü")
 
     def list_block_codes(self, owner: str = "") -> list[str]:
         codes = set(self.store.list_block_codes(owner))
@@ -576,8 +738,8 @@ class WarehouseService:
         except Leave as exc:
             return exc.result
 
-    def _choose(self, product_id: str, quantity: int):
-        spots = [spot for spot in self._positions(product_id) if spot["active"] and spot["quantity"] > 0]
+    def _choose(self, product_id: str, quantity: int, owner: str = ""):
+        spots = [spot for spot in self._positions(product_id, owner) if spot["active"] and spot["quantity"] > 0]
         spots.sort(key=lambda spot: (spot["block"], shelf_key(spot["shelf_code"])))
         for spot in spots:
             if spot["quantity"] >= quantity:
@@ -588,8 +750,8 @@ class WarehouseService:
             return self.store.get_location(spot["location_id"]), note
         return None, "Stokta yok"
 
-    def _positions(self, product_id: str) -> list[dict]:
-        locations = {item.id: item for item in self.store.list_locations()}
+    def _positions(self, product_id: str, owner: str = "") -> list[dict]:
+        locations = {item.id: item for item in self.store.list_locations() if item.owner_id == owner}
         rows = []
         for stock in self.store.list_stock():
             if stock.product_id != product_id:
@@ -723,6 +885,7 @@ class WarehouseService:
             "candidates": order.candidates,
             "sentence": sentence,
             "created_at": order.created_at,
+            "owner_id": order.owner_id,
         }
 
     def _return_view(self, item: ReturnRequest) -> dict:
@@ -777,8 +940,10 @@ class WarehouseService:
     def _inspect_notification(self, item: ReturnRequest) -> dict:
         url = f"{self.settings.public_base_url}/inspect/return/{item.inspect_token}"
         view = self._return_view(item)
+        order = self.store.get_order(item.original_order_id)
+        account = self.store.get_user(order.owner_id) if order and order.owner_id else None
         body = f"{view['order_id']} iadesi fiziksel kontrol bekliyor. Sağlamsa orijinal rafa eklenir.\n\nKontrol linki: {url}"
-        return {"to": self.settings.notify_email, "subject": f"Kontrol {view['order_id']}", "body": body, "inspect_url": url}
+        return {"to": account.email if account else self.settings.notify_email, "subject": "İade kontrolü", "body": body, "inspect_url": url}
 
     def _account_view(self, account: Account) -> dict:
         return {
@@ -841,11 +1006,169 @@ class WarehouseService:
             return False
         return True
 
-    def _ping_inspect(self, data: dict) -> None:
-        url = self.settings.inspect_webhook
+    def reminder_feed(self) -> dict:
+        pending = []
+        for order in self.store.list_orders():
+            if order.status != "beklemede" or self._hours_old(order.created_at) < 24:
+                continue
+            account = self.store.get_user(order.owner_id) if order.owner_id else None
+            pending.append(
+                {
+                    "to": account.email if account else self.settings.notify_email,
+                    "subject": "Bekleyen sipariş var",
+                    "body": f"{order.source} siparişi {order.order_id} bir gündür onay bekliyor. Stok, onaylayınca düşer.",
+                    "order_id": order.order_id,
+                    "source": order.source,
+                    "product_name": order.raw_product_text,
+                    "quantity": order.quantity,
+                }
+            )
+        low_stock = []
+        for account in self.store.list_users():
+            for row in self._stock_views(account.id):
+                if row["quantity"] > self.settings.low_stock_at:
+                    continue
+                low_stock.append(
+                    {
+                        "to": account.email,
+                        "subject": "Stok azaldı",
+                        "body": f"{row['product_name']} {row['location_label']} rafında {row['quantity']} adet kaldı.",
+                        "product_name": row["product_name"],
+                        "location_label": row["location_label"],
+                        "quantity": row["quantity"],
+                    }
+                )
+        return {"pending": pending, "low_stock": low_stock}
+
+    def daily_feed(self) -> list[dict]:
+        pending = [order for order in self.store.list_orders() if order.status == "beklemede"]
+        rows = []
+        for account in self.store.list_users():
+            if account.status != "onaylandı":
+                continue
+            mine = [order for order in pending if order.owner_id == account.id]
+            low = [row for row in self._stock_views(account.id) if row["quantity"] <= self.settings.low_stock_at]
+            if not mine and not low:
+                continue
+            lines = []
+            if mine:
+                lines.append(f"Bekleyen sipariş: {len(mine)}")
+                for order in mine:
+                    name = order.raw_product_text or "ürün"
+                    lines.append(f"- {order.source} {order.order_id}: {order.quantity} adet {name}")
+            if low:
+                lines.append(f"Azalan stok: {len(low)}")
+                for row in low:
+                    lines.append(f"- {row['product_name']} {row['location_label']} rafında {row['quantity']} adet")
+            rows.append({"to": account.email, "subject": "Günlük depo özeti", "body": "\n".join(lines)})
+        return rows
+
+    def channel_feed(self) -> list[dict]:
+        users = {account.id: account for account in self.store.list_users()}
+        rows = []
+        for link in self.store.list_all_channel_links():
+            if link["channel"] not in {"hepsiburada", "n11", "amazon"}:
+                continue
+            account = users.get(link["user_id"])
+            if account is None or not account.intake_key:
+                continue
+            try:
+                credentials = open_sealed(link["secrets"], self.settings.panel_secret)
+            except (ValueError, KeyError):
+                continue
+            rows.append(
+                {
+                    "channel": link["channel"],
+                    "to": account.email,
+                    "intake_url": f"{self.settings.public_base_url}/api/webhooks/in/{account.intake_key}",
+                    "credentials": credentials,
+                }
+            )
+        return rows
+
+    def _ping_new_order(self, order: dict) -> None:
+        account = self.store.get_user(str(order.get("owner_id") or "")) if order.get("owner_id") else None
+        name = order.get("raw_product_text") or "ürün"
+        self._post_n8n(
+            self.settings.order_webhook,
+            {
+                "type": "new_order",
+                "to": account.email if account else self.settings.notify_email,
+                "subject": "Yeni sipariş var",
+                "body": f"{order.get('source') or 'Sipariş'} {order.get('order_id')}: {order.get('quantity')} adet {name}. Stok, onaylayınca düşer.",
+                "order_id": order.get("order_id"),
+                "source": order.get("source"),
+                "product_name": name,
+                "quantity": order.get("quantity"),
+            },
+        )
+
+    def _ping_low_stock(self, data: dict) -> None:
+        after = data.get("stock_after")
+        if after is None or int(after) > self.settings.low_stock_at:
+            return
+        order = data.get("order") or {}
+        account = self.store.get_user(str(order.get("owner_id") or "")) if order.get("owner_id") else None
+        product = (order.get("matched_product") or {}).get("product_name") or order.get("raw_product_text") or "ürün"
+        self._post_n8n(
+            self.settings.low_stock_webhook,
+            {
+                "type": "low_stock",
+                "to": account.email if account else self.settings.notify_email,
+                "subject": "Stok azaldı",
+                "body": f"{product} {order.get('location_label') or 'rafta'} {after} adet kaldı.",
+                "product_name": product,
+                "quantity": after,
+            },
+        )
+
+    def _ping_channel_error(self, owner: str, channel_name: str, message: str) -> None:
+        account = self.store.get_user(owner)
+        self._post_n8n(
+            self.settings.channel_error_webhook,
+            {
+                "type": "channel_error",
+                "to": account.email if account else self.settings.notify_email,
+                "subject": "Kanal bağlantısı koptu",
+                "body": f"{channel_name} bağlantısı kurulamadı. {message}",
+                "channel": channel_name,
+            },
+        )
+
+    def _ping_channel(self, owner: str, channel: str, credentials: dict) -> None:
+        account = self.store.get_user(owner)
+        if account is None or not account.intake_key:
+            return
+        self._post_n8n(
+            self.settings.channel_webhook,
+            {
+                "type": "channel_sync",
+                "channel": channel,
+                "to": account.email,
+                "intake_url": f"{self.settings.public_base_url}/api/webhooks/in/{account.intake_key}",
+                "credentials": credentials,
+            },
+        )
+
+    def _hours_old(self, stamp: str) -> float:
+        if not stamp:
+            return 0
+        try:
+            moment = datetime.fromisoformat(stamp)
+        except ValueError:
+            return 0
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - moment).total_seconds() / 3600
+
+    def _post_n8n(self, url: str, payload: dict) -> None:
         if not url:
             return
         try:
-            httpx.post(url, json={"type": "return_inspection", **data}, timeout=5)
+            httpx.post(url, json=payload, timeout=8)
         except Exception:
-            log.warning("Kontrol webhook'u ulaşılamadı")
+            log.warning("n8n adresine ulaşılamadı")
+
+    def _ping_inspect(self, data: dict) -> None:
+        note = (data or {}).get("notification") or {}
+        self._post_n8n(self.settings.inspect_webhook, {"type": "return_inspection", **note})

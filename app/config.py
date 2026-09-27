@@ -65,6 +65,12 @@ class Settings:
     inspect_webhook: str
     approval_webhook: str
     signup_form: str
+    order_webhook: str = ""
+    low_stock_webhook: str = ""
+    reply_webhook: str = ""
+    channel_webhook: str = ""
+    channel_error_webhook: str = ""
+    low_stock_at: int = 5
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -103,6 +109,12 @@ class Settings:
             inspect_webhook=env("N8N_INSPECT_WEBHOOK"),
             approval_webhook=env("N8N_APPROVAL_WEBHOOK"),
             signup_form=env("N8N_SIGNUP_FORM"),
+            order_webhook=env("N8N_ORDER_WEBHOOK"),
+            low_stock_webhook=env("N8N_LOW_STOCK_WEBHOOK"),
+            reply_webhook=env("N8N_REPLY_WEBHOOK"),
+            channel_webhook=env("N8N_CHANNEL_WEBHOOK"),
+            channel_error_webhook=env("N8N_CHANNEL_ERROR_WEBHOOK"),
+            low_stock_at=int(env("LOW_STOCK_AT", "5") or "5"),
         )
 
     @property

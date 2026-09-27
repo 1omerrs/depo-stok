@@ -20,6 +20,7 @@ class Account:
     status: str
     created_at: str = ""
     mail_sent: bool = False
+    intake_key: str = ""
 
 
 @dataclass
@@ -76,6 +77,7 @@ class Order:
     stock_note: str | None = None
     created_at: str = ""
     updated_at: str = ""
+    owner_id: str = ""
 
 
 @dataclass
