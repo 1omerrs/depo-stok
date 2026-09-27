@@ -16,15 +16,23 @@ const state = {
   unsuitable: null,
   returnForm: { order_id: "", return_reason: "fikir değişikliği" },
   busy: false,
-  screen: "login",
+  screen: "welcome",
   openBlock: "",
   openShelf: "",
   blocks: [],
   members: [],
+  messages: [],
   noticeOpen: false,
+  composeFor: "",
+  channels: [],
+  openChannel: "",
+  support: [],
+  helpFor: "",
+  confirmDelete: "",
+  replyFor: "",
 };
 
-const views = ["stok", "siparis", "iade", "uyeler"];
+const views = ["stok", "siparis", "iade", "uyeler", "kullanicilar", "mesajlar"];
 
 function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
@@ -48,6 +56,25 @@ function badge(status) {
     : status === "iptal" || status === "reddedildi" ? "bad"
     : status === "beklemede" || status === "talep edildi" || status === "kontrol bekliyor" ? "warn" : "info";
   return `<span class="badge ${tone}">${esc(status)}</span>`;
+}
+
+function unansweredMessages() {
+  return (state.support || []).filter((row) => !row.reply).length;
+}
+
+function shelfMeter(item) {
+  const rows = state.stock.filter((row) => row.location_id === item.id);
+  const qty = rows.reduce((sum, row) => sum + Number(row.quantity || 0), 0);
+  const cap = Number(item.capacity) || 0;
+  let pct = 8;
+  if (cap > 0) pct = Math.round((qty / cap) * 100);
+  else if (qty > 0) pct = Math.min(100, 16 + qty * 8);
+  return { pct: Math.max(8, Math.min(100, pct)), hot: qty > 0 && qty <= 5 };
+}
+
+function meter(fills) {
+  const bars = (fills.length ? fills : [{ pct: 8, hot: false }]).slice(0, 3).map((bar) => `<i class="${bar.hot ? "hot" : ""}" style="--fill:${bar.pct}%"></i>`).join("");
+  return `<span class="meter" aria-hidden="true">${bars}</span>`;
 }
 
 function stockRows() {
@@ -82,19 +109,59 @@ function shell(content) {
         <label>E-posta<input name="email" type="email" required></label>
         <label>Şirket adı<input name="company_name" required></label>
         <label>Parola<input name="password" type="password" minlength="6" required></label>
-        <button class="primary" type="submit">Üyelik talebi gönder</button>
-        <button type="button" class="ghost" data-action="show-login">Girişe dön</button>
+        <div class="auth-actions">
+          <button class="primary" type="submit">Üyelik talebi gönder</button>
+          <a class="ghost ink" href="/giris" data-action="show-login">Giriş yap</a>
+        </div>
       </form></main>`;
     }
-    return `<main class="wrap"><form class="card login" id="login">
-      <p class="mark">Depo Stok</p>
-      <h1>Giriş</h1>
-      ${flash}
-      <label>E-posta<input name="username" type="email" autocomplete="username" required></label>
-      <label>Parola<input name="password" type="password" autocomplete="current-password" required></label>
-      <button class="primary" type="submit">Giriş yap</button>
-      <button type="button" class="ghost" data-action="show-signup">Üye ol</button>
-    </form></main>`;
+    if (state.screen === "login") {
+      return `<main class="wrap"><form class="card login" id="login">
+        <p class="mark">Depo Stok</p>
+        <h1>Giriş</h1>
+        ${flash}
+        <label>E-posta<input name="username" type="email" autocomplete="username" required></label>
+        <label>Parola<input name="password" type="password" autocomplete="current-password" required></label>
+        <div class="auth-actions">
+          <button class="primary" type="submit">Giriş yap</button>
+          <a class="ghost ink" href="/uye-ol" data-action="show-signup">Üye ol</a>
+        </div>
+      </form></main>`;
+    }
+    return `<main class="welcome">
+      <section class="welcome-copy">
+        <p class="mark">Depo-Stok</p>
+        <h1>Stok takibi tek panelde.</h1>
+        <p class="lede">Siparişler listeye düşer. Adet, onaydan sonra değişir.</p>
+        <div class="welcome-actions">
+          <a class="primary" href="/giris" data-action="show-login">Giriş yap</a>
+          <a class="ghost ink" href="/uye-ol" data-action="show-signup">Üye ol</a>
+        </div>
+      </section>
+      <section class="welcome-stage" aria-hidden="true">
+        <div class="aisle">
+          <span>A Blok</span>
+          <i style="--fill: 78%"></i>
+          <i style="--fill: 46%"></i>
+          <i style="--fill: 90%"></i>
+          <b>101</b>
+        </div>
+        <div class="aisle hot">
+          <span>B Blok</span>
+          <i style="--fill: 22%"></i>
+          <i style="--fill: 14%"></i>
+          <i style="--fill: 38%"></i>
+          <b>204</b>
+        </div>
+        <div class="aisle">
+          <span>C Blok</span>
+          <i style="--fill: 64%"></i>
+          <i style="--fill: 81%"></i>
+          <i style="--fill: 55%"></i>
+          <b>310</b>
+        </div>
+      </section>
+    </main>`;
   }
   const admin = state.user.role === "admin";
   const pendingMembers = state.members.filter((row) => row.status === "beklemede").length;
@@ -102,27 +169,37 @@ function shell(content) {
   const pendingReturns = state.returns.filter((row) => row.status === "talep edildi" || row.status === "kontrol bekliyor").length;
   const item = (id, label, count) => `<button type="button" data-action="nav" data-view="${id}" class="nav-item ${state.view === id ? "active" : ""}"><span>${label}</span>${count ? `<span class="count">${count}</span>` : ""}</button>`;
   const who = state.user.name || state.user.email || "";
-  const notice = state.noticeOpen ? `<div class="notice-panel"><p class="kicker">Nasıl kullanılır</p><p>Blok ekle, raf koy, rafa ürün yaz. Adedi yanındaki + ve − ile değiştir.</p></div>` : "";
+  const unseen = state.messages.filter((row) => !row.seen).length;
+  const notes = state.messages.map((row) => `<article class="note"><p>${esc(row.body)}</p><time>${esc((row.created_at || "").replace("T", " ").slice(0, 16))}</time></article>`).join("");
+  const notice = state.noticeOpen ? `<aside class="notice-panel">
+      <p class="kicker">Bildirimler</p>
+      ${notes || `<p class="muted">Yeni mesaj yok.</p>`}
+      <p class="kicker">Nasıl kullanılır</p>
+      <p class="guide">Blok ekle, raf koy, rafa ürün yaz. Adedi yanındaki + ve − ile değiştir.</p>
+    </aside>` : "";
+  const bellCount = unseen ? `<span class="count">${unseen}</span>` : "";
   return `<header class="top">
       <div class="brand">
         <span class="brand-mark" aria-hidden="true">D</span>
         <span class="brand-copy"><strong>Depo Stok</strong><small>${admin ? "Yönetim" : "Depo paneli"}</small></span>
       </div>
       <nav class="nav top-nav" aria-label="Sayfalar">
-        ${admin ? "" : `${item("stok", "Stok", 0)}
+        ${admin ? `${item("kullanicilar", "Kullanıcılar", pendingMembers)}
+        ${item("mesajlar", "Mesajlar", unansweredMessages())}` : `${item("stok", "Stok", 0)}
         ${item("siparis", "Siparişler", pendingOrders)}
         ${item("iade", "İadeler", pendingReturns)}`}
       </nav>
       <div class="session">
         <span class="who">${esc(who)}</span>
-        ${admin ? "" : `<button type="button" class="ghost logout" data-action="toggle-notice">Bildirim</button>`}
+        ${admin ? "" : `<button type="button" class="bell" data-action="toggle-notice" aria-label="Bildirimler"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a5 5 0 0 0-5 5v2.1c0 .7-.3 1.4-.8 1.9L5 13.2V15h14v-1.8l-1.2-1.2a2.7 2.7 0 0 1-.8-1.9V8a5 5 0 0 0-5-5zm0 18a2.5 2.5 0 0 0 2.4-2h-4.8A2.5 2.5 0 0 0 12 21z"/></svg>${bellCount}</button>`}
         <button type="button" class="ghost logout" data-action="logout">Çıkış</button>
       </div>
     </header>
     ${notice}
     <main class="wrap">${state.flash ? `<p class="flash ${esc(state.flash.tone)}">${esc(state.flash.text)}</p>` : ""}${content}</main>
     <nav class="bottom-nav" aria-label="Sayfalar">
-      ${admin ? "" : `${item("stok", "Stok", 0)}
+      ${admin ? `${item("kullanicilar", "Üyeler", pendingMembers)}
+      ${item("mesajlar", "Mesaj", unansweredMessages())}` : `${item("stok", "Stok", 0)}
       ${item("siparis", "Sipariş", pendingOrders)}
       ${item("iade", "İade", pendingReturns)}`}
     </nav>`;
@@ -152,7 +229,7 @@ function viewStock() {
       <div>
         <p class="kicker">Depo yerleşimi</p>
         <h1>Stok</h1>
-        ${codes.length ? `<p class="hint">Bloğu seçin, rafı açın. Var olan ürünün adedini yanındaki düğmelerle değiştirebilir veya yeni ürün ekleyebilirsiniz.</p>` : `<p class="welcome">Blok ekle, raf koy, rafa ürün yaz.</p>`}
+        ${codes.length ? `<p class="hint">Bloğu seçin, rafı açın. Var olan ürünün adedini yanındaki düğmelerle değiştirebilir veya yeni ürün ekleyebilirsiniz.</p>` : `<p class="hint">Blok ekle, raf koy, rafa ürün yaz.</p>`}
       </div>
       <form class="toolbar" id="block-form">
         <label>Yeni blok<input name="code" placeholder="Örn. D" required></label>
@@ -161,11 +238,13 @@ function viewStock() {
     </header>
     <div class="block-board">
       ${codes.map((code) => {
-        const count = state.locations.filter((item) => item.block === code).length;
+        const shelvesInBlock = state.locations.filter((item) => item.block === code);
+        const fills = shelvesInBlock.slice(0, 3).map(shelfMeter);
         return `<button type="button" class="block-tile ${state.openBlock === code ? "active" : ""}" data-action="open-block" data-block="${esc(code)}">
           <span class="eyebrow">Blok</span>
+          ${meter(fills)}
           <span class="letter">${esc(code)}</span>
-          <span class="meta">${count} raf</span>
+          <span class="meta">${shelvesInBlock.length} raf</span>
         </button>`;
       }).join("") || `<p class="empty">Henüz blok yok. Yukarıdan bir blok ekleyin.</p>`}
     </div>
@@ -185,8 +264,10 @@ function viewStock() {
       <div class="shelf-board">
         ${shelves.map((item) => {
           const productCount = state.stock.filter((row) => row.location_id === item.id).length;
+          const level = shelfMeter(item);
           return `<button type="button" class="shelf-tile ${state.openShelf === item.id ? "active" : ""}" data-action="open-shelf" data-id="${esc(item.id)}">
             <span class="eyebrow">Raf</span>
+            ${meter([level])}
             <span class="code">${esc(item.shelf_code)}</span>
             <span class="meta">${productCount} ürün</span>
           </button>`;
@@ -253,12 +334,65 @@ function viewOrders() {
       ${match}
     </article>`;
   }).join("");
-  return `<h1>Siparişler</h1>
+  return `<section class="page-head"><div><h1>Siparişler</h1><p>Satış kanalınızı seçin. Bağlantı bir kez kurulur. Gelen sipariş burada görünür ve onayınızla stoktan düşer.</p></div>
     <select id="order-status">
       <option value="">Tüm durumlar</option>
       ${["beklemede", "tamamlandı", "iptal"].map((item) => `<option ${state.orderStatus === item ? "selected" : ""}>${item}</option>`).join("")}
-    </select>
-    ${cards || `<p class="card">Sipariş yok</p>`}`;
+    </select></section>
+    ${channelBoard()}
+    ${cards || `<p class="card">Henüz sipariş gelmedi.</p>`}`;
+}
+
+function channelBoard() {
+  const rows = state.channels || [];
+  const tiles = rows.map((row) => {
+    const mark = row.connected ? "Bağlı" : row.mode === "webhook" ? "Hazır" : row.mode === "oauth" ? "Sırada" : "Bağla";
+    return `<button type="button" class="channel-tile ${state.openChannel === row.code ? "active" : ""} ${row.connected ? "connected" : ""}" data-action="open-channel" data-channel="${esc(row.code)}">
+      <strong>${esc(row.name)}</strong><span>${mark}</span>
+    </button>`;
+  }).join("");
+  const open = rows.find((row) => row.code === state.openChannel);
+  if (!open) return `<div class="channel-grid">${tiles}</div>`;
+  return `<div class="channel-grid">${tiles}</div>${channelPanel(open)}`;
+}
+
+function channelPanel(open) {
+  const writing = state.helpFor === open.code;
+  const steps = (open.steps || []).map((item) => `<li>${esc(item)}</li>`).join("");
+  const note = `<div class="channel-copy">
+      <p class="kicker">Bağlantı</p>
+      <h2>${esc(open.name)}</h2>
+      <p class="lead">${esc(open.lead || open.hint)}</p>
+      ${steps ? `<ol class="steps">${steps}</ol>` : ""}
+      <button type="button" class="ghost ink" data-action="open-help" data-channel="${esc(open.code)}">Bize mesaj gönder</button>
+      ${writing ? `<label class="msg-box">Mesaj<textarea id="help-${esc(open.code)}" maxlength="500" placeholder="Kısaca yazın"></textarea></label>
+      <button class="primary" type="button" data-action="send-help" data-channel="${esc(open.code)}">Gönder</button>` : ""}
+    </div>`;
+  if (open.mode === "webhook") {
+    const intake = state.user?.intake_key ? `${location.origin}/api/webhooks/in/${state.user.intake_key}` : "";
+    return `<section class="channel-panel">${note}
+      <div class="channel-bind">
+        <p class="kicker">Sipariş geliş adresi</p>
+        <p class="hint">Bu adres yalnızca sizin deponuza aittir. Siteniz yeni siparişi buraya gönderir.</p>
+        <p class="link-box">${esc(intake)}</p>
+        <button type="button" class="ghost ink" data-action="copy-intake" data-url="${esc(intake)}">Adresi kopyala</button>
+      </div>
+    </section>`;
+  }
+  const fields = (open.fields || []).map((field) => `<label>${esc(field.label)}<input name="${esc(field.name)}" ${field.secret ? 'type="password"' : ""} autocomplete="off" required></label>`).join("");
+  return `<section class="channel-panel">${note}
+    <form id="channel-form" class="channel-bind">
+      <p class="kicker">Bağlama bilgileri</p>
+      ${open.last_error ? `<p class="flash bad">${esc(open.last_error)}</p>` : ""}
+      ${open.live ? "" : `<p class="hint">Bilgiler saklanır. Siparişlerin otomatik düşmesi bu kanal için henüz açık değil.</p>`}
+      <input type="hidden" name="code" value="${esc(open.code)}">
+      ${fields}
+      <div class="actions">
+        <button class="primary" type="submit">${open.live ? "Bağla ve siparişleri al" : "Bağlantıyı kaydet"}</button>
+        ${open.connected ? `<button class="ghost" type="button" data-action="disconnect-channel" data-channel="${esc(open.code)}">Bağlantıyı kaldır</button>` : ""}
+      </div>
+    </form>
+  </section>`;
 }
 
 function viewReturns() {
@@ -339,11 +473,19 @@ function viewAdmin() {
       ${row.status === "beklemede" ? `<div class="actions">
         <button class="primary" type="button" data-action="approve-member" data-id="${esc(row.id)}">Onayla</button>
         <button class="danger" type="button" data-action="reject-member" data-id="${esc(row.id)}">Reddet</button>
-      </div>` : row.status === "onaylandı" && row.mail_sent ? `<div class="actions">
-        <button class="sent" type="button" disabled>Onay maili gönderildi</button>
-      </div>` : row.status === "onaylandı" ? `<div class="actions">
-        <button class="primary" type="button" data-action="approve-member" data-id="${esc(row.id)}">Onay mailini gönder</button>
+      </div>` : row.status === "onaylandı" ? `<div class="actions stack">
+        ${row.mail_sent
+          ? `<button class="sent" type="button" disabled>Onay maili gönderildi</button>`
+          : `<button class="primary" type="button" data-action="approve-member" data-id="${esc(row.id)}">Onay mailini gönder</button>`}
+        <button class="ghost ink" type="button" data-action="open-message" data-id="${esc(row.id)}">Kullanıcıya mesaj gönder</button>
+        ${state.composeFor === row.id ? `<label class="msg-box">Mesaj<textarea id="msg-${esc(row.id)}" maxlength="500" placeholder="Kısa bir duyuru yazın"></textarea></label>
+        <button class="primary" type="button" data-action="send-message" data-id="${esc(row.id)}">Gönder</button>` : ""}
       </div>` : ""}
+      <div class="actions">
+        ${state.confirmDelete === row.id
+          ? `<button class="danger" type="button" data-action="delete-member" data-id="${esc(row.id)}">Emin misin? Sil</button>`
+          : `<button class="danger quiet" type="button" data-action="ask-delete" data-id="${esc(row.id)}">Kullanıcıyı sil</button>`}
+      </div>
     </article>`).join("");
   return `<header class="page-head">
       <div>
@@ -358,6 +500,29 @@ function viewAdmin() {
       <article class="stat"><span>Reddedilen</span><strong>${rejected}</strong></article>
     </div>
     <div class="member-grid">${cards || `<p class="empty">Henüz üye yok.</p>`}</div>`;
+}
+
+function viewInbox() {
+  const cards = (state.support || []).map((row) => `<article class="card">
+      <div class="row"><strong>${esc(row.sender_name)}</strong> <span class="badge info">${esc(row.channel || "Genel")}</span></div>
+      <p class="muted">${esc(row.sender_email)} · ${esc(row.company_name)}</p>
+      <p>${esc(row.body)}</p>
+      <time class="muted">${esc((row.created_at || "").replace("T", " ").slice(0, 16))}</time>
+      ${row.reply ? `<p class="reply"><span class="kicker">Cevabınız</span>${esc(row.reply)}</p>` : ""}
+      <div class="actions">
+        <button type="button" class="ghost ink" data-action="open-reply" data-id="${esc(row.id)}">Cevap yaz</button>
+        ${state.replyFor === row.id ? `<label class="msg-box">Cevap<textarea id="reply-${esc(row.id)}" maxlength="500" placeholder="Üyeye iletilecek cevap"></textarea></label>
+        <button class="primary" type="button" data-action="send-reply" data-id="${esc(row.id)}">Gönder</button>` : ""}
+      </div>
+    </article>`).join("");
+  return `<header class="page-head">
+      <div>
+        <p class="kicker">Yönetim</p>
+        <h1>Mesajlar</h1>
+        <p class="hint">Üyeler satış yeri kartından buraya yazar.</p>
+      </div>
+    </header>
+    ${cards || `<p class="card">Henüz mesaj yok.</p>`}`;
 }
 
 function viewMembers() {
@@ -376,24 +541,32 @@ function viewMembers() {
 
 function paint() {
   const admin = state.user?.role === "admin";
-  const content = admin ? viewAdmin()
+  const content = admin ? (state.view === "mesajlar" ? viewInbox() : viewAdmin())
     : state.view === "siparis" ? viewOrders()
     : state.view === "iade" ? viewReturns()
     : viewStock();
+  document.body.classList.toggle("guest", !state.user);
   document.getElementById("app").innerHTML = shell(state.user ? content : "");
 }
 
 async function loadAll() {
   const calls = [api("/api/stock"), api("/api/orders"), api("/api/returns"), api("/api/options"), api("/api/blocks")];
-  if (state.user?.role === "admin") calls.push(api("/api/members"));
-  const [stock, orders, returns, options, blocks, members] = await Promise.all(calls);
+  if (state.user?.role === "admin") calls.push(api("/api/members"), api("/api/support"));
+  else calls.push(api("/api/messages"), api("/api/channels"));
+  const [stock, orders, returns, options, blocks, extra, channels] = await Promise.all(calls);
   state.stock = stock.data?.rows || [];
   state.orders = orders.data?.rows || [];
   state.returns = returns.data?.rows || [];
   state.products = options.data?.products || [];
   state.locations = options.data?.locations || [];
   state.blocks = blocks.data?.blocks || [];
-  state.members = members?.data?.rows || [];
+  if (state.user?.role === "admin") {
+    state.members = extra?.data?.rows || [];
+    state.support = channels?.data?.rows || [];
+  } else {
+    state.messages = extra?.data?.rows || [];
+    state.channels = channels?.data?.rows || [];
+  }
 }
 
 async function run(fn) {
@@ -418,12 +591,11 @@ document.body.addEventListener("click", (event) => {
   if (!button) return;
   const action = button.dataset.action;
   const id = button.dataset.id;
-  if (action === "show-signup") {
-    state.screen = "signup";
-    state.flash = null;
-    paint();
-  } else if (action === "show-login") {
-    state.screen = "login";
+  if (action === "show-signup" || action === "show-login") {
+    event.preventDefault();
+    const path = action === "show-signup" ? "/uye-ol" : "/giris";
+    if (location.pathname !== path) history.pushState({}, "", path);
+    state.screen = action === "show-signup" ? "signup" : "login";
     state.flash = null;
     paint();
   } else if (action === "approve-member" || action === "reject-member") {
@@ -433,14 +605,84 @@ document.body.addEventListener("click", (event) => {
       state.flash = { tone: result.ok ? "ok" : "bad", text: result.message };
       await loadAll();
     });
+  } else if (action === "copy-intake") {
+    const text = button.dataset.url || "";
+    navigator.clipboard.writeText(text).then(() => {
+      state.flash = { tone: "ok", text: "Sipariş geliş adresi kopyalandı" };
+      paint();
+    }).catch(() => {
+      state.flash = { tone: "bad", text: "Adres kopyalanamadı" };
+      paint();
+    });
+  } else if (action === "open-help") {
+    state.helpFor = state.helpFor === button.dataset.channel ? "" : button.dataset.channel;
+    paint();
+  } else if (action === "send-help") {
+    const text = document.getElementById(`help-${button.dataset.channel}`)?.value || "";
+    run(async () => {
+      const result = await api("/api/support", { method: "POST", body: { channel: button.dataset.channel, body: text } });
+      state.flash = { tone: result.ok ? "ok" : "bad", text: result.message };
+      if (result.ok) state.helpFor = "";
+    });
+  } else if (action === "open-reply") {
+    state.replyFor = state.replyFor === id ? "" : id;
+    paint();
+  } else if (action === "send-reply") {
+    const text = document.getElementById(`reply-${id}`)?.value || "";
+    run(async () => {
+      const result = await api(`/api/support/${id}/reply`, { method: "POST", body: { body: text } });
+      state.flash = { tone: result.ok ? "ok" : "bad", text: result.message };
+      if (result.ok) state.replyFor = "";
+      await loadAll();
+    });
+  } else if (action === "ask-delete") {
+    state.confirmDelete = state.confirmDelete === id ? "" : id;
+    paint();
+  } else if (action === "delete-member") {
+    run(async () => {
+      const result = await api(`/api/members/${id}`, { method: "DELETE" });
+      state.flash = { tone: result.ok ? "ok" : "bad", text: result.message };
+      if (result.ok) state.confirmDelete = "";
+      await loadAll();
+    });
+  } else if (action === "open-channel") {
+    state.openChannel = state.openChannel === button.dataset.channel ? "" : button.dataset.channel;
+    paint();
+  } else if (action === "disconnect-channel") {
+    run(async () => {
+      const result = await api(`/api/channels/${button.dataset.channel}`, { method: "DELETE" });
+      state.flash = { tone: result.ok ? "ok" : "bad", text: result.message };
+      await loadAll();
+    });
   } else if (action === "nav") {
     state.view = views.includes(button.dataset.view) ? button.dataset.view : "stok";
     state.preview = null;
     state.flash = null;
     location.hash = state.view;
+    const linked = state.view === "siparis" && (state.channels || []).some((row) => row.connected && row.live);
+    if (!linked) paint();
+    else run(async () => {
+      const synced = await api("/api/channels/sync", { method: "POST", body: {} });
+      if (synced.data?.imported) state.flash = { tone: "ok", text: synced.message };
+      else if (!synced.ok && synced.message) state.flash = { tone: "bad", text: synced.message };
+      await loadAll();
+    });
+  } else if (action === "open-message") {
+    state.composeFor = state.composeFor === id ? "" : id;
     paint();
+  } else if (action === "send-message") {
+    const text = document.getElementById(`msg-${id}`)?.value || "";
+    run(async () => {
+      const result = await api(`/api/members/${id}/message`, { method: "POST", body: { body: text } });
+      state.flash = { tone: result.ok ? "ok" : "bad", text: result.message };
+      if (result.ok) state.composeFor = "";
+    });
   } else if (action === "toggle-notice") {
     state.noticeOpen = !state.noticeOpen;
+    if (state.noticeOpen && state.messages.some((row) => !row.seen)) {
+      state.messages = state.messages.map((row) => ({ ...row, seen: true }));
+      api("/api/messages/seen", { method: "POST", body: {} });
+    }
     paint();
   } else if (action === "logout") {
     run(async () => { await api("/api/logout", { method: "POST", body: {} }); state.user = null; });
@@ -559,7 +801,10 @@ document.body.addEventListener("submit", (event) => {
     run(async () => {
       const result = await api("/api/register", { method: "POST", body: readForm(form) });
       state.flash = { tone: result.ok ? "ok" : "bad", text: result.message };
-      if (result.ok) state.screen = "login";
+      if (result.ok) {
+        if (location.pathname !== "/giris") history.pushState({}, "", "/giris");
+        state.screen = "login";
+      }
     });
   }
   if (form.id === "block-form") {
@@ -580,6 +825,22 @@ document.body.addEventListener("submit", (event) => {
       await loadAll();
     });
   }
+  if (form.id === "channel-form") {
+    event.preventDefault();
+    const data = readForm(form);
+    const code = data.code;
+    delete data.code;
+    run(async () => {
+      const result = await api(`/api/channels/${code}`, { method: "POST", body: data });
+      state.flash = { tone: result.ok ? "ok" : "bad", text: result.message };
+      if (result.ok && result.code === "connected") {
+        const synced = await api("/api/channels/sync", { method: "POST", body: {} });
+        if (synced.data?.imported) state.flash = { tone: "ok", text: synced.message };
+        else if (!synced.ok && synced.message) state.flash = { tone: "bad", text: synced.message };
+      }
+      await loadAll();
+    });
+  }
   if (form.id === "return-form") {
     event.preventDefault();
     run(async () => {
@@ -591,18 +852,33 @@ document.body.addEventListener("submit", (event) => {
   }
 });
 
+function screenFromPath() {
+  if (location.pathname === "/yonetim") return "admin";
+  if (location.pathname === "/uye-ol") return "signup";
+  if (location.pathname === "/giris") return "login";
+  return "welcome";
+}
+
 async function boot() {
   const meta = await api("/api/meta");
   state.mailConfigured = Boolean(meta.data?.mail_configured);
-  if (location.pathname === "/yonetim") state.screen = "admin";
+  state.screen = screenFromPath();
   const me = await api("/api/me");
   if (me.ok) {
     state.user = me.data.user;
     const hash = location.hash.replace("#", "");
     state.view = views.includes(hash) ? hash : "stok";
+    if (state.user.role === "admin" && state.view !== "mesajlar") state.view = "kullanicilar";
     await loadAll();
   }
   paint();
 }
+
+window.addEventListener("popstate", () => {
+  if (state.user) return;
+  state.screen = screenFromPath();
+  state.flash = null;
+  paint();
+});
 
 boot();

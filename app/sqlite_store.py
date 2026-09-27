@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 import threading
 from contextlib import contextmanager, nullcontext
@@ -77,6 +78,34 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS blocks (
   code TEXT PRIMARY KEY
 );
+CREATE TABLE IF NOT EXISTS channel_links (
+  user_id TEXT NOT NULL,
+  channel TEXT NOT NULL,
+  secrets TEXT NOT NULL,
+  connected_at TEXT NOT NULL,
+  last_sync_at TEXT,
+  last_error TEXT,
+  PRIMARY KEY (user_id, channel)
+);
+CREATE TABLE IF NOT EXISTS support_messages (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  sender_name TEXT NOT NULL,
+  sender_email TEXT NOT NULL,
+  company_name TEXT NOT NULL,
+  channel TEXT NOT NULL DEFAULT '',
+  body TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  reply TEXT,
+  replied_at TEXT
+);
+CREATE TABLE IF NOT EXISTS member_messages (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  body TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  seen INTEGER NOT NULL DEFAULT 0
+);
 CREATE INDEX IF NOT EXISTS idx_orders_order_id ON orders(order_id);
 CREATE INDEX IF NOT EXISTS idx_returns_order ON returns(original_order_id);
 """
@@ -132,8 +161,8 @@ class SqliteStore:
         with self._guard():
             self._exec(
                 """
-                INSERT INTO users (id, first_name, last_name, email, company_name, password_hash, status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO users (id, first_name, last_name, email, company_name, password_hash, status, created_at, intake_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     account.id,
@@ -144,6 +173,7 @@ class SqliteStore:
                     account.password_hash,
                     account.status,
                     account.created_at,
+                    account.intake_key,
                 ),
             )
         return account
@@ -161,10 +191,130 @@ class SqliteStore:
             row = self.conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
         return self._account(row) if row else None
 
+    def upsert_channel_link(self, user_id: str, channel: str, secrets: str, connected_at: str) -> None:
+        with self._guard():
+            self._exec(
+                """
+                INSERT INTO channel_links (user_id, channel, secrets, connected_at, last_sync_at, last_error)
+                VALUES (?, ?, ?, ?, NULL, NULL)
+                ON CONFLICT(user_id, channel) DO UPDATE SET
+                  secrets=excluded.secrets, connected_at=excluded.connected_at, last_error=NULL
+                """,
+                (user_id, channel, secrets, connected_at),
+            )
+
+    def list_all_channel_links(self) -> list[dict]:
+        with self._guard():
+            rows = self.conn.execute(
+                "SELECT user_id, channel, secrets, connected_at FROM channel_links"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_stock_quantity(self, product_id: str, location_id: str) -> int:
+        with self._guard():
+            row = self.conn.execute(
+                "SELECT quantity FROM stock WHERE product_id = ? AND location_id = ?",
+                (product_id, location_id),
+            ).fetchone()
+        return int(row["quantity"]) if row else 0
+
+    def list_channel_links(self, user_id: str) -> list[dict]:
+        with self._guard():
+            rows = self.conn.execute(
+                "SELECT channel, secrets, connected_at, last_sync_at, last_error FROM channel_links WHERE user_id = ?",
+                (user_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_channel_link(self, user_id: str, channel: str) -> None:
+        with self._guard():
+            self._exec("DELETE FROM channel_links WHERE user_id = ? AND channel = ?", (user_id, channel))
+
+    def touch_channel_link(self, user_id: str, channel: str, last_sync_at: str | None, last_error: str | None) -> None:
+        with self._guard():
+            self._exec(
+                "UPDATE channel_links SET last_sync_at = ?, last_error = ? WHERE user_id = ? AND channel = ?",
+                (last_sync_at, last_error, user_id, channel),
+            )
+
+    def find_user_by_intake(self, intake_key: str) -> Account | None:
+        with self._guard():
+            row = self.conn.execute("SELECT * FROM users WHERE intake_key = ?", (intake_key,)).fetchone()
+        return self._account(row) if row else None
+
     def find_user_by_email(self, email: str) -> Account | None:
         with self._guard():
             row = self.conn.execute("SELECT * FROM users WHERE email = ? COLLATE NOCASE", (email,)).fetchone()
         return self._account(row) if row else None
+
+    def insert_support(self, message_id: str, user_id: str, sender_name: str, sender_email: str, company_name: str, channel: str, body: str, created_at: str) -> None:
+        with self._guard():
+            self._exec(
+                """
+                INSERT INTO support_messages (
+                  id, user_id, sender_name, sender_email, company_name, channel, body, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (message_id, user_id, sender_name, sender_email, company_name, channel, body, created_at),
+            )
+
+    def list_support(self) -> list[dict]:
+        with self._guard():
+            rows = self.conn.execute(
+                """
+                SELECT id, user_id, sender_name, sender_email, company_name, channel, body, created_at, reply, replied_at
+                FROM support_messages ORDER BY created_at DESC
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_support(self, message_id: str) -> dict | None:
+        with self._guard():
+            row = self.conn.execute("SELECT * FROM support_messages WHERE id = ?", (message_id,)).fetchone()
+        return dict(row) if row else None
+
+    def save_support_reply(self, message_id: str, reply: str, replied_at: str) -> None:
+        with self._guard():
+            self._exec(
+                "UPDATE support_messages SET reply = ?, replied_at = ? WHERE id = ?",
+                (reply, replied_at, message_id),
+            )
+
+    def delete_member_data(self, user_id: str) -> None:
+        with self._guard():
+            order_ids = [row["id"] for row in self.conn.execute("SELECT id FROM orders WHERE owner_id = ?", (user_id,))]
+            for order_id in order_ids:
+                self._exec("DELETE FROM returns WHERE original_order_id = ?", (order_id,))
+            self._exec("DELETE FROM orders WHERE owner_id = ?", (user_id,))
+            location_ids = [row["id"] for row in self.conn.execute("SELECT id FROM locations WHERE owner_id = ?", (user_id,))]
+            for location_id in location_ids:
+                self._exec("DELETE FROM stock WHERE location_id = ?", (location_id,))
+                self._exec("UPDATE orders SET proposed_location_id = NULL WHERE proposed_location_id = ?", (location_id,))
+                self._exec("UPDATE orders SET source_location_id = NULL WHERE source_location_id = ?", (location_id,))
+                self._exec("DELETE FROM locations WHERE id = ?", (location_id,))
+            self._exec("DELETE FROM blocks WHERE owner_id = ?", (user_id,))
+            self._exec("DELETE FROM channel_links WHERE user_id = ?", (user_id,))
+            self._exec("DELETE FROM member_messages WHERE user_id = ?", (user_id,))
+            self._exec("DELETE FROM users WHERE id = ?", (user_id,))
+
+    def insert_message(self, message_id: str, user_id: str, body: str, created_at: str) -> None:
+        with self._guard():
+            self._exec(
+                "INSERT INTO member_messages (id, user_id, body, created_at) VALUES (?, ?, ?, ?)",
+                (message_id, user_id, body, created_at),
+            )
+
+    def list_messages(self, user_id: str) -> list[dict]:
+        with self._guard():
+            rows = self.conn.execute(
+                "SELECT id, body, created_at, seen FROM member_messages WHERE user_id = ? ORDER BY created_at DESC",
+                (user_id,),
+            ).fetchall()
+        return [{"id": row["id"], "body": row["body"], "created_at": row["created_at"], "seen": bool(row["seen"])} for row in rows]
+
+    def mark_messages_seen(self, user_id: str) -> None:
+        with self._guard():
+            self._exec("UPDATE member_messages SET seen = 1 WHERE user_id = ? AND seen = 0", (user_id,))
 
     def list_users(self) -> list[Account]:
         with self._guard():
@@ -262,6 +412,24 @@ class SqliteStore:
         user_cols = {row[1] for row in self.conn.execute("PRAGMA table_info(users)")}
         if "mail_sent" not in user_cols:
             self.conn.execute("ALTER TABLE users ADD COLUMN mail_sent INTEGER NOT NULL DEFAULT 0")
+        if "intake_key" not in user_cols:
+            self.conn.execute("ALTER TABLE users ADD COLUMN intake_key TEXT NOT NULL DEFAULT ''")
+        for row in self.conn.execute("SELECT id FROM users WHERE intake_key = ''").fetchall():
+            self.conn.execute(
+                "UPDATE users SET intake_key = ? WHERE id = ?",
+                (secrets.token_urlsafe(18), row["id"]),
+            )
+        self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_intake ON users(intake_key)")
+        message_cols = {row[1] for row in self.conn.execute("PRAGMA table_info(member_messages)")}
+        if message_cols and "seen" not in message_cols:
+            self.conn.execute("ALTER TABLE member_messages ADD COLUMN seen INTEGER NOT NULL DEFAULT 0")
+        support_cols = {row[1] for row in self.conn.execute("PRAGMA table_info(support_messages)")}
+        if support_cols and "reply" not in support_cols:
+            self.conn.execute("ALTER TABLE support_messages ADD COLUMN reply TEXT")
+            self.conn.execute("ALTER TABLE support_messages ADD COLUMN replied_at TEXT")
+        order_cols = {row[1] for row in self.conn.execute("PRAGMA table_info(orders)")}
+        if "owner_id" not in order_cols:
+            self.conn.execute("ALTER TABLE orders ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''")
         self.conn.execute("PRAGMA foreign_keys = ON")
 
     def list_block_codes(self, owner_id: str = "") -> list[str]:
@@ -408,6 +576,7 @@ class SqliteStore:
             order.stock_note,
             order.created_at,
             order.updated_at,
+            order.owner_id,
             order.id,
         )
         with self._guard():
@@ -419,7 +588,7 @@ class SqliteStore:
                       external_key=?, order_id=?, source=?, raw_product_text=?, matched_product_id=?,
                       match_confidence=?, match_method=?, candidates_json=?, quantity=?,
                       proposed_location_id=?, source_location_id=?, status=?, needs_manual_match=?,
-                      approval_token=?, stock_note=?, created_at=?, updated_at=?
+                      approval_token=?, stock_note=?, created_at=?, updated_at=?, owner_id=?
                     WHERE id=?
                     """,
                     payload,
@@ -431,8 +600,8 @@ class SqliteStore:
                       external_key, order_id, source, raw_product_text, matched_product_id,
                       match_confidence, match_method, candidates_json, quantity,
                       proposed_location_id, source_location_id, status, needs_manual_match,
-                      approval_token, stock_note, created_at, updated_at, id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      approval_token, stock_note, created_at, updated_at, owner_id, id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     payload,
                 )
@@ -509,6 +678,7 @@ class SqliteStore:
             status=row["status"],
             created_at=row["created_at"],
             mail_sent=bool(row["mail_sent"]) if "mail_sent" in row.keys() else False,
+            intake_key=row["intake_key"] if "intake_key" in row.keys() else "",
         )
 
     def _product(self, row) -> Product:
@@ -564,6 +734,7 @@ class SqliteStore:
             stock_note=row["stock_note"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            owner_id=row["owner_id"] if "owner_id" in row.keys() else "",
         )
 
     def _return(self, row) -> ReturnRequest:

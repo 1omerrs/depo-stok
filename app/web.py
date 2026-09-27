@@ -89,6 +89,24 @@ def health(request: Request):
     return {"ok": True, "backend": _settings(request).data_backend, "products": count}
 
 
+@router.get("/api/n8n/reminders")
+def n8n_reminders(request: Request):
+    _webhook_ok(request)
+    return {"ok": True, "data": _service(request).reminder_feed()}
+
+
+@router.get("/api/n8n/channels")
+def n8n_channels(request: Request):
+    _webhook_ok(request)
+    return {"ok": True, "data": {"rows": _service(request).channel_feed()}}
+
+
+@router.get("/api/n8n/summary")
+def n8n_summary(request: Request):
+    _webhook_ok(request)
+    return {"ok": True, "data": {"rows": _service(request).daily_feed()}}
+
+
 @router.get("/api/meta")
 def meta(request: Request):
     settings = _settings(request)
@@ -140,6 +158,56 @@ def approve_member(user_id: str, request: Request):
 def reject_member(user_id: str, request: Request):
     _require_admin(request)
     return _json(_service(request).reject_member(user_id))
+
+
+@router.delete("/api/members/{user_id}")
+def delete_member(user_id: str, request: Request):
+    _require_admin(request)
+    return _json(_service(request).delete_member(user_id))
+
+
+@router.get("/api/support")
+def support_inbox(request: Request):
+    _require_admin(request)
+    return {"ok": True, "data": {"rows": _service(request).list_support()}}
+
+
+@router.post("/api/support/{message_id}/reply")
+async def reply_support(message_id: str, request: Request):
+    _require_admin(request)
+    body = await request.json()
+    return _json(_service(request).reply_support(message_id, str(body.get("body") or "")))
+
+
+@router.post("/api/support")
+async def send_support(request: Request):
+    user = _require_user(request)
+    if user.get("role") != "member":
+        raise HTTPException(status_code=403, detail="Bu işlem üye hesabı içindir")
+    body = await request.json()
+    return _json(_service(request).send_support(str(user.get("id") or ""), str(body.get("channel") or ""), str(body.get("body") or "")))
+
+
+@router.post("/api/members/{user_id}/message")
+def member_message(user_id: str, request: Request, body: dict):
+    _require_admin(request)
+    return _json(_service(request).send_member_message(user_id, str(body.get("body", ""))))
+
+
+@router.get("/api/messages")
+def my_messages(request: Request):
+    user = _require_user(request)
+    if user.get("role") != "member":
+        return {"ok": True, "data": {"rows": []}}
+    return {"ok": True, "data": {"rows": _service(request).list_my_messages(str(user.get("id") or ""))}}
+
+
+@router.post("/api/messages/seen")
+def see_messages(request: Request):
+    user = _require_user(request)
+    if user.get("role") != "member":
+        return {"ok": True, "code": "seen", "message": "", "data": {}}
+    return _json(_service(request).mark_my_messages_seen(str(user.get("id") or "")))
 
 
 @router.get("/api/blocks")
@@ -221,7 +289,11 @@ def logout(request: Request):
 
 @router.get("/api/me")
 def me(request: Request):
-    user = _require_user(request)
+    user = dict(_require_user(request))
+    if user.get("role") == "member" and user.get("id"):
+        account = _service(request).store.get_user(str(user["id"]))
+        if account is not None:
+            user["intake_key"] = account.intake_key
     return {"ok": True, "code": "ok", "message": "", "data": {"user": user}}
 
 
@@ -231,10 +303,44 @@ def stock(request: Request, q: str = "", block: str = ""):
     return {"ok": True, "data": {"rows": _service(request).list_stock(q, block, _owner(request))}}
 
 
+@router.get("/api/channels")
+def channels(request: Request):
+    _require_user(request)
+    if _owner(request) == "" and _require_user(request).get("role") != "member":
+        return {"ok": True, "data": {"rows": []}}
+    return {"ok": True, "data": {"rows": _service(request).list_channels(_owner(request))}}
+
+
+@router.post("/api/channels/sync")
+def sync_channels(request: Request):
+    user = _require_user(request)
+    if user.get("role") != "member":
+        return _json(Result(True, "idle", "", data={"imported": 0}))
+    return _json(_service(request).sync_channels(str(user.get("id") or "")))
+
+
+@router.post("/api/channels/{code}")
+async def connect_channel(code: str, request: Request):
+    user = _require_user(request)
+    if user.get("role") != "member":
+        raise HTTPException(status_code=403, detail="Bu işlem üye hesabı içindir")
+    body = await request.json()
+    fields = body if isinstance(body, dict) else {}
+    return _json(_service(request).save_channel(str(user.get("id") or ""), code, fields))
+
+
+@router.delete("/api/channels/{code}")
+def disconnect_channel(code: str, request: Request):
+    user = _require_user(request)
+    if user.get("role") != "member":
+        raise HTTPException(status_code=403, detail="Bu işlem üye hesabı içindir")
+    return _json(_service(request).disconnect_channel(str(user.get("id") or ""), code))
+
+
 @router.get("/api/orders")
 def orders(request: Request, status: str = "", source: str = ""):
     _require_user(request)
-    return {"ok": True, "data": {"rows": _service(request).list_orders(status, source)}}
+    return {"ok": True, "data": {"rows": _service(request).list_orders(status, source, _owner(request))}}
 
 
 @router.get("/api/returns")
@@ -333,6 +439,14 @@ async def webhook_order(request: Request):
     return await _ingest(request, source)
 
 
+@router.post("/api/webhooks/in/{intake_key}")
+async def webhook_member_order(intake_key: str, request: Request):
+    account = _service(request).store.find_user_by_intake(intake_key)
+    if account is None or account.status != "onaylandı":
+        return _json(Result(False, "not_found", "Sipariş adresi bulunamadı", 404))
+    return await _ingest(request, None, owner=account.id, open_source=True)
+
+
 @router.post("/api/webhooks/returns")
 async def webhook_return(request: Request):
     _webhook_ok(request)
@@ -391,15 +505,18 @@ def inspect_post(token: str, request: Request):
     return _page(_service(request).restock_return(token=token), "", "")
 
 
-async def _ingest(request: Request, source: str | None):
+async def _ingest(request: Request, source: str | None, owner: str = "", open_source: bool = False):
     try:
         payload = await request.json()
-        lines = normalize(payload, source)
+        lines = normalize(payload, source, open_source=open_source)
     except PayloadError as exc:
         return _json(Result(False, "invalid", exc.message, 400))
     except Exception:
         return _json(Result(False, "invalid", "Sipariş gövdesi okunamadı", 400))
-    results = [_service(request).ingest_order(line).json() for line in lines]
+    if owner:
+        for line in lines:
+            line.external_key = f"{owner}|{line.external_key}"
+    results = [_service(request).ingest_order(line, owner).json() for line in lines]
     if any(item["code"] == "created" for item in results):
         status = 201
     elif results and not results[0]["ok"]:
