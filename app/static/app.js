@@ -3,6 +3,7 @@ const state = {
   mailConfigured: false,
   view: "stok",
   stock: [],
+  summary: { in_total: 0, out_total: 0, entries: [], exits: [] },
   orders: [],
   returns: [],
   products: [],
@@ -218,6 +219,25 @@ function stockTableHtml() {
     </table>`;
 }
 
+function shortWhen(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString("tr-TR", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
+}
+
+function summaryColumn(kind, title, total, rows, empty) {
+  const shown = rows.slice(0, 8);
+  const extra = rows.length - shown.length;
+  const items = shown.map((row) => `<li>
+      <div><strong>${esc(row.product_name)}</strong><small>${esc(row.location_label || "")}</small></div>
+      <div class="move-qty"><b>${row.quantity}</b><small>${esc(row.reason || "")}</small><time>${esc(shortWhen(row.created_at))}</time></div>
+    </li>`).join("");
+  return `<article class="summary-card ${kind}">
+      <header><div><p class="kicker">Son 30 gün</p><h2>${title}</h2></div><strong class="total">${total}</strong></header>
+      <ul class="move-list">${items || `<li class="empty">${empty}</li>`}${extra ? `<li class="muted">+${extra} hareket daha</li>` : ""}</ul>
+    </article>`;
+}
+
 function viewStock() {
   const codes = [...new Set([...(state.blocks || []), ...state.locations.map((item) => item.block)])].sort();
   const shelves = state.locations.filter((item) => item.block === state.openBlock);
@@ -236,6 +256,10 @@ function viewStock() {
         <button class="primary" type="submit">Blok ekle</button>
       </form>
     </header>
+    <section class="stock-summary" aria-label="Son 30 gün">
+      ${summaryColumn("in", "Girişler", (state.summary || {}).in_total || 0, (state.summary || {}).entries || [], "Son 30 günde giriş yok.")}
+      ${summaryColumn("out", "Çıkışlar", (state.summary || {}).out_total || 0, (state.summary || {}).exits || [], "Son 30 günde çıkış yok.")}
+    </section>
     <div class="block-board">
       ${codes.map((code) => {
         const shelvesInBlock = state.locations.filter((item) => item.block === code);
@@ -318,20 +342,79 @@ function viewStock() {
     </section>` : ""}`;
 }
 
+function orderGroups(rows) {
+  const groups = [];
+  const index = new Map();
+  rows.forEach((row) => {
+    const key = `${row.source}|${row.order_id}`;
+    if (!index.has(key)) {
+      const group = { key, source: row.source, order_id: row.order_id, lines: [] };
+      index.set(key, group);
+      groups.push(group);
+    }
+    index.get(key).lines.push(row);
+  });
+  return groups;
+}
+
+function lineNeedsChoice(row) {
+  return !!row.needs_manual_match;
+}
+
+function outOfStock(row) {
+  return row.status === "beklemede" && !row.needs_manual_match && !!row.matched_product && !row.location_label;
+}
+
 function viewOrders() {
-  const cards = state.orders.filter((row) => !state.orderStatus || row.status === state.orderStatus).map((row) => {
-    const match = row.needs_manual_match
-      ? `<p>${esc(row.sentence || "")}</p>
-         <div class="actions">${(row.candidates || []).map((item) => `<button type="button" data-action="match" data-id="${esc(row.id)}" data-product="${esc(item.product_id)}">${esc(item.product_name)} %${item.confidence}</button>`).join("")}</div>
-         <label>Katalogdan seç<select data-catalog="${esc(row.id)}">${state.products.map((item) => `<option value="${esc(item.id)}">${esc(item.sku)} — ${esc(item.product_name)}</option>`).join("")}</select></label>
-         <button type="button" data-action="match-select" data-id="${esc(row.id)}">Eşleştirmeyi kaydet</button>`
-      : `<p class="quote">${esc(row.sentence || row.raw_product_text)}</p>
-         ${row.status === "beklemede" ? `<button class="primary" type="button" data-action="approve-order" data-id="${esc(row.id)}">Onayla ve stoktan düş</button>` : ""}`;
-    return `<article class="card">
-      <div class="row"><strong>${esc(row.order_id)}</strong> ${badge(row.status)} <span class="badge info">${esc(row.source)}</span>
-      ${row.match_confidence != null ? `<span class="badge">${esc(row.match_confidence)}%</span>` : ""}</div>
-      <p class="muted">${esc(row.raw_product_text)} · ${row.quantity} adet · ${esc(row.match_method_label || "")}</p>
-      ${match}
+  const visible = state.orders.filter((row) => !state.orderStatus || row.status === state.orderStatus);
+  const cards = orderGroups(visible).map((group) => {
+    const pending = group.lines.filter((row) => row.status === "beklemede");
+    const openLines = pending.filter(lineNeedsChoice);
+    const missing = pending.filter(outOfStock);
+    const ready = pending.find((row) => !lineNeedsChoice(row) && !outOfStock(row));
+    const status = group.lines.every((row) => row.status === "tamamlandı")
+      ? "tamamlandı"
+      : group.lines.every((row) => row.status === "iptal")
+        ? "iptal"
+        : pending.length ? "beklemede" : group.lines[0].status;
+    const lines = group.lines.map((row, index) => {
+      const choice = outOfStock(row)
+        ? `<p class="flash warn">Stokta yok</p>`
+        : lineNeedsChoice(row)
+        ? `<p class="line-note">${esc(row.sentence || "Bu ürünü katalogdan seçin.")}</p>
+           <div class="actions">${(row.candidates || []).map((item) => `<button type="button" data-action="match" data-id="${esc(row.id)}" data-product="${esc(item.product_id)}">${esc(item.product_name)} %${item.confidence}</button>`).join("")}</div>
+           <label>Katalogdan seç<select data-catalog="${esc(row.id)}">${state.products.map((item) => `<option value="${esc(item.id)}">${esc(item.sku)} — ${esc(item.product_name)}</option>`).join("")}</select></label>
+           <button type="button" data-action="match-select" data-id="${esc(row.id)}">Eşleştirmeyi kaydet</button>`
+        : `<p class="line-note">${esc(row.sentence || row.raw_product_text)}</p>`;
+      return `<li class="order-line">
+        <div class="line-top">
+          <span class="line-no">${String(index + 1).padStart(2, "0")}</span>
+          <div>
+            <strong>${esc(row.raw_product_text)}</strong>
+            <p class="muted">${esc(row.match_method_label || "")}</p>
+          </div>
+          <span class="qty-pill">${row.quantity} adet</span>
+        </div>
+        ${choice}
+      </li>`;
+    }).join("");
+    const foot = missing.length
+      ? `<p>Stokta yok.</p>`
+      : openLines.length && group.lines.length > 1
+      ? `<p>Bu siparişte ${openLines.length} ürün seçilmedi. Hepsi seçilmeden onaylanmaz.</p>`
+      : ready
+        ? `<p>${group.lines.length > 1 ? "Ürünlerin hepsi seçildi." : "Onaylayınca stoktan düşer."}</p><button class="primary" type="button" data-action="approve-order" data-id="${esc(ready.id)}">Onayla ve stoktan düş</button>`
+        : `<p>${status === "tamamlandı" ? "Stok düşüldü." : ""}</p>`;
+    return `<article class="order-card">
+      <header>
+        <div>
+          <p class="kicker">${esc(group.source)}</p>
+          <h2>${esc(group.order_id)}</h2>
+        </div>
+        <div class="row">${badge(status)}<span class="badge">${group.lines.length} ürün</span></div>
+      </header>
+      <ol class="order-lines">${lines}</ol>
+      <footer class="order-foot">${foot}</footer>
     </article>`;
   }).join("");
   return `<section class="page-head"><div><h1>Siparişler</h1><p>Satış kanalınızı seçin. Bağlantı bir kez kurulur. Gelen sipariş burada görünür ve onayınızla stoktan düşer.</p></div>
@@ -340,7 +423,7 @@ function viewOrders() {
       ${["beklemede", "tamamlandı", "iptal"].map((item) => `<option ${state.orderStatus === item ? "selected" : ""}>${item}</option>`).join("")}
     </select></section>
     ${channelBoard()}
-    ${cards || `<p class="card">Henüz sipariş gelmedi.</p>`}`;
+    ${cards ? `<div class="order-stack">${cards}</div>` : `<p class="card">Henüz sipariş gelmedi.</p>`}`;
 }
 
 function channelBoard() {
@@ -555,6 +638,7 @@ async function loadAll() {
   else calls.push(api("/api/messages"), api("/api/channels"));
   const [stock, orders, returns, options, blocks, extra, channels] = await Promise.all(calls);
   state.stock = stock.data?.rows || [];
+  state.summary = stock.data?.summary || { in_total: 0, out_total: 0, entries: [], exits: [] };
   state.orders = orders.data?.rows || [];
   state.returns = returns.data?.rows || [];
   state.products = options.data?.products || [];

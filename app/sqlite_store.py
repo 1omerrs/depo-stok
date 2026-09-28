@@ -108,6 +108,18 @@ CREATE TABLE IF NOT EXISTS member_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_orders_order_id ON orders(order_id);
 CREATE INDEX IF NOT EXISTS idx_returns_order ON returns(original_order_id);
+CREATE TABLE IF NOT EXISTS stock_moves (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL DEFAULT '',
+  product_name TEXT NOT NULL,
+  block TEXT NOT NULL DEFAULT '',
+  shelf_code TEXT NOT NULL DEFAULT '',
+  delta INTEGER NOT NULL,
+  reason TEXT NOT NULL,
+  ref TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_stock_moves_owner ON stock_moves(owner_id, created_at);
 """
 
 
@@ -531,6 +543,37 @@ class SqliteStore:
             else:
                 self._exec("UPDATE stock SET quantity = ? WHERE id = ?", (new_qty, current_row.id))
             return new_qty
+
+    def add_stock_move(self, owner_id: str, product_name: str, block: str, shelf_code: str, delta: int, reason: str, ref: str = "", created_at: str = "") -> None:
+        with self._guard():
+            self._exec(
+                """
+                INSERT INTO stock_moves (id, owner_id, product_name, block, shelf_code, delta, reason, ref, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (secrets.token_hex(16), owner_id, product_name, block, shelf_code, delta, reason, ref, created_at),
+            )
+
+    def list_stock_moves(self, owner_id: str, since: str) -> list[dict]:
+        with self._guard():
+            rows = self.conn.execute(
+                """
+                SELECT product_name, block, shelf_code, delta, reason, created_at
+                FROM stock_moves
+                WHERE owner_id = ? AND created_at >= ?
+                ORDER BY created_at DESC
+                """,
+                (owner_id, since),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_move_refs(self, owner_id: str) -> set[str]:
+        with self._guard():
+            rows = self.conn.execute(
+                "SELECT ref FROM stock_moves WHERE owner_id = ? AND ref != ''",
+                (owner_id,),
+            ).fetchall()
+        return {row["ref"] for row in rows}
 
     def get_order(self, order_id: str) -> Order | None:
         with self._guard():

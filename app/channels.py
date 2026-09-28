@@ -30,9 +30,9 @@ CHANNELS = (
         "code": "hepsiburada",
         "name": "Hepsiburada",
         "mode": "api",
-        "live": False,
-        "hint": "Entegrasyon bilgileri ile kaydedilir.",
-        "lead": "Hepsiburada mağazanız, satıcı panelindeki entegrasyon bilgileriyle kaydedilir. Mağaza şifresi istenmez.",
+        "live": True,
+        "hint": "Entegrasyon bilgileri ile bağlanır.",
+        "lead": "Hepsiburada mağazanız, satıcı panelindeki entegrasyon bilgileriyle bağlanır. Mağaza şifresi istenmez.",
         "steps": (
             "Hepsiburada satıcı paneline giriş yapın.",
             "Entegrasyon bölümünden Mağaza ID ve servis anahtarını alın.",
@@ -47,9 +47,9 @@ CHANNELS = (
         "code": "n11",
         "name": "n11",
         "mode": "api",
-        "live": False,
-        "hint": "API bilgileri ile kaydedilir.",
-        "lead": "n11 mağazanız, hesap sayfasındaki API bilgileriyle kaydedilir.",
+        "live": True,
+        "hint": "API bilgileri ile bağlanır.",
+        "lead": "n11 mağazanız, hesap sayfasındaki API bilgileriyle bağlanır. Mağaza şifresi istenmez.",
         "steps": (
             "n11 hesabınızda API bilgilerim sayfasını açın.",
             "API anahtarı ve API şifresini kopyalayın.",
@@ -141,6 +141,93 @@ def pull_trendyol(secrets: dict) -> list[IncomingLine]:
     except ValueError as exc:
         raise ChannelError("Trendyol yanıtı okunamadı") from exc
     return _trendyol_lines(payload if isinstance(payload, dict) else {})
+
+
+def pull_hepsiburada(secrets: dict) -> list[IncomingLine]:
+    merchant = str(secrets.get("merchant_id") or "").strip()
+    service_key = str(secrets.get("service_key") or "").strip()
+    if not merchant or not service_key:
+        raise ChannelError("Hepsiburada bilgileri eksik")
+    token = base64.b64encode(f"{merchant}:{service_key}".encode()).decode()
+    payload = _get_json(
+        f"https://oms-external.hepsiburada.com/orders/merchantid/{merchant}",
+        params={"limit": 100},
+        headers={"Authorization": f"Basic {token}", "User-Agent": "depo-stok", "Accept": "application/json"},
+        label="Hepsiburada",
+    )
+    return _order_lines(payload.get("items") or [], source="Hepsiburada", key="Hepsiburada")
+
+
+def pull_n11(secrets: dict) -> list[IncomingLine]:
+    app_key = str(secrets.get("app_key") or "").strip()
+    app_secret = str(secrets.get("app_secret") or "").strip()
+    if not app_key or not app_secret:
+        raise ChannelError("n11 bilgileri eksik")
+    headers = {"appkey": app_key, "appsecret": app_secret, "Accept": "application/json"}
+    lines: list[IncomingLine] = []
+    for status in ("Created", "Picking"):
+        payload = _get_json(
+            "https://api.n11.com/rest/delivery/v1/shipmentPackages",
+            params={"page": 0, "size": 100, "status": status},
+            headers=headers,
+            label="n11",
+        )
+        lines.extend(_order_lines(payload.get("content") or [], source="n11", key="n11"))
+    return lines
+
+
+def _get_json(url: str, *, params: dict, headers: dict, label: str) -> dict:
+    try:
+        response = httpx.get(url, params=params, headers=headers, timeout=25)
+    except httpx.HTTPError as exc:
+        raise ChannelError(f"{label}’a ulaşılamadı") from exc
+    if response.status_code in {401, 403}:
+        raise ChannelError(f"{label} bilgileri kabul edilmedi")
+    if response.status_code >= 400:
+        raise ChannelError(f"{label} sipariş listesini vermedi")
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise ChannelError(f"{label} yanıtı okunamadı") from exc
+    return payload if isinstance(payload, dict) else {}
+
+
+def _order_lines(rows: list, *, source: str, key: str) -> list[IncomingLine]:
+    lines: list[IncomingLine] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        nested = row.get("lines")
+        items = nested if isinstance(nested, list) and nested else [row]
+        order_id = str(row.get("orderNumber") or row.get("orderId") or row.get("id") or "").strip()
+        for index, item in enumerate(items, start=1):
+            if not isinstance(item, dict):
+                continue
+            current_id = order_id or str(item.get("orderNumber") or item.get("orderId") or "").strip()
+            if not current_id:
+                continue
+            name = str(item.get("productName") or "").strip()
+            sku = str(item.get("merchantSku") or item.get("merchantSKU") or item.get("stockCode") or item.get("sku") or "").strip() or None
+            barcode = str(item.get("barcode") or "").strip() or None
+            try:
+                quantity = int(item.get("quantity") or 0)
+            except (TypeError, ValueError):
+                quantity = 0
+            if quantity <= 0 or not (name or sku or barcode):
+                continue
+            part = sku or barcode or f"line{index}"
+            lines.append(
+                IncomingLine(
+                    source=source,
+                    order_id=current_id,
+                    product_name=name or sku or barcode or "",
+                    quantity=quantity,
+                    external_key=f"{key}|{current_id}|{part}",
+                    sku=sku,
+                    barcode=barcode,
+                )
+            )
+    return lines
 
 
 def _trendyol_lines(payload: dict) -> list[IncomingLine]:

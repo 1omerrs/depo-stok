@@ -4,11 +4,11 @@ import logging
 import re
 import secrets
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
-from app.channels import ChannelError, channel_by_code, CHANNELS, pull_trendyol
+from app.channels import ChannelError, channel_by_code, CHANNELS, pull_hepsiburada, pull_n11, pull_trendyol
 from app.config import Settings
 from app.matching import Matcher
 from app.secretbox import open_sealed, seal
@@ -90,19 +90,26 @@ class WarehouseService:
                 raise Leave(Result(False, "not_found", "Sipariş bulunamadı", 404))
             if order.status in ORDER_DONE:
                 raise Leave(Result(True, "already_processed", "Bu sipariş zaten işlendi"))
-            if not order.needs_manual_match:
+            if not order.needs_manual_match and order.proposed_location_id:
                 raise Leave(Result(False, "invalid_state", "Bu sipariş manuel eşleştirme beklemiyor", 409))
             product = self.store.get_product(product_id)
             if product is None:
                 raise Leave(Result(False, "not_found", "Ürün bulunamadı", 404))
+            place, note = self._choose(product.id, order.quantity, order.owner_id)
+            if place is None or note:
+                order.needs_manual_match = True
+                order.proposed_location_id = None
+                order.stock_note = "Bu üründe yeterli stok yok. Başka bir ürün seçin."
+                order.updated_at = now_iso()
+                self.store.save_order(order)
+                return Result(False, "insufficient_stock", order.stock_note, 409, {"order": self._order_view(order)})
             self._remember_alias(product, order.raw_product_text)
             order.matched_product_id = product.id
             order.match_confidence = 100
             order.match_method = "manual"
             order.needs_manual_match = False
-            place, note = self._choose(product.id, order.quantity, order.owner_id)
-            order.proposed_location_id = place.id if place else None
-            order.stock_note = note
+            order.proposed_location_id = place.id
+            order.stock_note = None
             order.updated_at = now_iso()
             self.store.save_order(order)
             return Result(
@@ -123,34 +130,64 @@ class WarehouseService:
                 raise Leave(Result(True, "already_processed", "Bu sipariş zaten işlendi", data={"order": self._order_view(order)}))
             if order.status == "iptal":
                 raise Leave(Result(False, "invalid_state", "Sipariş iptal edilmiş", 409))
-            if order.needs_manual_match or not order.matched_product_id:
-                raise Leave(Result(False, "needs_manual_match", "Bu sipariş manuel ürün eşleştirmesi bekliyor", 409, {"order": self._order_view(order)}))
-            if not order.proposed_location_id:
-                place, note = self._choose(order.matched_product_id, order.quantity, order.owner_id)
-                order.proposed_location_id = place.id if place else None
-                order.stock_note = note
-            if not order.proposed_location_id:
-                raise Leave(Result(False, "insufficient_stock", "Stokta yok. Stok düşülmedi.", 409, {"order": self._order_view(order)}))
-            location = self.store.get_location(order.proposed_location_id)
-            if location is None or not location.active:
-                raise Leave(Result(False, "location_unsuitable", "Seçilen raf artık uygun değil. Stok düşülmedi.", 409))
-            try:
-                self.store.adjust_stock(order.matched_product_id, location.id, -order.quantity)
-            except StockError as exc:
-                if exc.code == "negative":
-                    raise Leave(Result(False, "insufficient_stock", "Bu rafta yeterli stok yok. Stok düşülmedi.", 409, {"order": self._order_view(order)}))
-                raise
-            order.source_location_id = location.id
-            order.status = "tamamlandı"
-            order.updated_at = now_iso()
-            self.store.save_order(order)
-            new_qty = self.store.get_stock_quantity(order.matched_product_id, location.id)
-            view = self._order_view(order)
-            return Result(True, "completed", "Stok düşüldü, sipariş tamamlandı.", data={"order": view, "stock_after": new_qty})
+            blocked = self._bundle_block(order)
+            if blocked:
+                raise Leave(Result(False, "needs_manual_match", blocked, 409, {"order": self._order_view(order)}))
+            pending = [item for item in self._bundle(order) if item.status == "beklemede"]
+            planned: list[tuple[Order, object]] = []
+            for item in pending:
+                if not item.proposed_location_id:
+                    place, note = self._choose(item.matched_product_id, item.quantity, item.owner_id)
+                    if place is None or note:
+                        return self._reopen_product_choice(item)
+                    item.proposed_location_id = place.id
+                    item.stock_note = None
+                location = self.store.get_location(item.proposed_location_id)
+                if location is None or not location.active:
+                    raise Leave(Result(False, "location_unsuitable", "Seçilen raf artık uygun değil. Stok düşülmedi.", 409))
+                planned.append((item, location))
+            demand: dict[tuple[str, str], int] = {}
+            for item, location in planned:
+                key = (item.matched_product_id or "", location.id)
+                demand[key] = demand.get(key, 0) + item.quantity
+            for (product_id, location_id), need in demand.items():
+                if self.store.get_stock_quantity(product_id, location_id) >= need:
+                    continue
+                for item, location in planned:
+                    if item.matched_product_id == product_id and location.id == location_id:
+                        self._reopen_product_choice(item)
+                return Result(False, "insufficient_stock", "Stokta yok", 409)
+            views = []
+            for item, location in planned:
+                try:
+                    self.store.adjust_stock(item.matched_product_id, location.id, -item.quantity)
+                    product = self.store.get_product(item.matched_product_id)
+                    self._note_move(
+                        item.owner_id,
+                        product.product_name if product else item.raw_product_text,
+                        location.block,
+                        location.shelf_code,
+                        -item.quantity,
+                        f"Sipariş {item.order_id}",
+                        item.id,
+                    )
+                except StockError as exc:
+                    if exc.code == "negative":
+                        raise Leave(Result(False, "insufficient_stock", "Stokta yok", 409))
+                    raise
+                item.source_location_id = location.id
+                item.status = "tamamlandı"
+                item.updated_at = now_iso()
+                self.store.save_order(item)
+                views.append({"order": self._order_view(item), "stock_after": self.store.get_stock_quantity(item.matched_product_id, location.id)})
+            message = "Stok düşüldü, sipariş tamamlandı." if len(views) == 1 else f"{len(views)} ürün stoktan düşüldü, sipariş tamamlandı."
+            return Result(True, "completed", message, data={"order": views[-1]["order"], "stock_after": views[-1]["stock_after"], "lines": views})
 
         result = self._run(op)
         if result.ok and result.code == "completed":
-            self._ping_low_stock(result.data or {})
+            payload = result.data or {}
+            for row in payload.get("lines") or [payload]:
+                self._ping_low_stock(row)
         return result
 
     def describe_order_token(self, token: str) -> Result:
@@ -160,8 +197,9 @@ class WarehouseService:
         view = self._order_view(order)
         if order.status in ORDER_DONE:
             return Result(True, "already_processed", "Bu sipariş zaten işlendi", data={"order": view, "can_confirm": False})
-        if order.needs_manual_match:
-            return Result(False, "needs_manual_match", "Bu sipariş manuel ürün eşleştirmesi bekliyor", 409, {"order": view, "can_confirm": False})
+        blocked = self._bundle_block(order)
+        if blocked:
+            return Result(False, "needs_manual_match", blocked, 409, {"order": view, "can_confirm": False})
         sentence = view.get("sentence") or "Sipariş onay bekliyor"
         return Result(True, "pending", sentence, data={"order": view, "can_confirm": True})
 
@@ -240,6 +278,8 @@ class WarehouseService:
                     raise Leave(Result(False, "location_unsuitable", f"Seçilen raf uygun değil ({alt_why}).", 409, {"return": self._return_view(item)}))
             try:
                 self.store.adjust_stock(order.matched_product_id, target.id, order.quantity)
+                product = self.store.get_product(order.matched_product_id)
+                self._note_move(order.owner_id, product.product_name if product else order.raw_product_text, target.block, target.shelf_code, order.quantity, "İade", item.id)
             except StockError as exc:
                 message = "Seçilen rafın kapasitesi dolu." if exc.code == "capacity" else "Stok güncellenemedi."
                 raise Leave(Result(False, "location_unsuitable", message, 409))
@@ -323,6 +363,10 @@ class WarehouseService:
             except StockError as exc:
                 message = "Kapasite aşılıyor." if exc.code == "capacity" else "Stok güncellenemedi."
                 raise Leave(Result(False, "capacity_exceeded", message, 409))
+            product = self.store.get_product(product_id)
+            location = self.store.get_location(location_id)
+            if product and location:
+                self._note_move(owner, product.product_name, location.block, location.shelf_code, quantity, "Rafa ekleme")
             return Result(True, "added", preview.message, data={**(preview.data or {}), "resulting_quantity": new_qty})
 
         return self._run(op)
@@ -340,6 +384,55 @@ class WarehouseService:
             selected.append(row)
         selected.sort(key=lambda row: (row["block"], shelf_key(row["shelf_code"]), row["sku"]))
         return selected
+
+    def stock_summary(self, owner: str = "") -> dict:
+        self._backfill_order_exits(owner)
+        since = (datetime.now(timezone.utc) - timedelta(days=30)).replace(microsecond=0).isoformat()
+        rows = self.store.list_stock_moves(owner, since)
+        entries = [self._move_view(row) for row in rows if row["delta"] > 0]
+        exits = [self._move_view(row) for row in rows if row["delta"] < 0]
+        return {
+            "days": 30,
+            "in_total": sum(row["quantity"] for row in entries),
+            "out_total": sum(row["quantity"] for row in exits),
+            "entries": entries,
+            "exits": exits,
+        }
+
+    def _move_view(self, row: dict) -> dict:
+        return {
+            "product_name": row["product_name"],
+            "location_label": location_label(row["block"], row["shelf_code"]) if row["block"] and row["shelf_code"] else "",
+            "quantity": abs(int(row["delta"])),
+            "reason": row["reason"],
+            "created_at": row["created_at"],
+        }
+
+    def _note_move(self, owner: str, product_name: str, block: str, shelf_code: str, delta: int, reason: str, ref: str = "", created_at: str = "") -> None:
+        if not delta:
+            return
+        self.store.add_stock_move(owner, product_name, block, shelf_code, delta, reason, ref, created_at or now_iso())
+
+    def _backfill_order_exits(self, owner: str) -> None:
+        since = (datetime.now(timezone.utc) - timedelta(days=30)).replace(microsecond=0).isoformat()
+        known = self.store.list_move_refs(owner)
+        for order in self.store.list_orders():
+            if order.owner_id != owner or order.status != "tamamlandı" or order.id in known:
+                continue
+            if not order.updated_at or order.updated_at < since or not order.matched_product_id:
+                continue
+            product = self.store.get_product(order.matched_product_id)
+            location = self.store.get_location(order.source_location_id) if order.source_location_id else None
+            self._note_move(
+                owner,
+                product.product_name if product else order.raw_product_text,
+                location.block if location else "",
+                location.shelf_code if location else "",
+                -order.quantity,
+                f"Sipariş {order.order_id}",
+                order.id,
+                order.updated_at,
+            )
 
     def list_channels(self, owner: str) -> list[dict]:
         saved = {row["channel"]: row for row in self.store.list_channel_links(owner)}
@@ -388,11 +481,12 @@ class WarehouseService:
         notes: list[str] = []
         for link in self.store.list_channel_links(owner):
             spec = channel_by_code(link["channel"])
-            if spec is None or not spec["live"] or spec["code"] != "trendyol":
+            pull = {"trendyol": pull_trendyol, "hepsiburada": pull_hepsiburada, "n11": pull_n11}.get(spec["code"] if spec else "")
+            if spec is None or not spec["live"] or pull is None:
                 continue
             try:
                 secrets = open_sealed(link["secrets"], self.settings.panel_secret)
-                lines = pull_trendyol(secrets)
+                lines = pull(secrets)
             except (ChannelError, ValueError) as exc:
                 message = exc.message if isinstance(exc, ChannelError) else "Bağlantı bilgisi okunamadı"
                 self.store.touch_channel_link(owner, link["channel"], link.get("last_sync_at"), message)
@@ -410,7 +504,12 @@ class WarehouseService:
         return Result(True, "synced", f"{imported} yeni sipariş düştü" if imported else "", data={"imported": imported})
 
     def list_orders(self, status: str = "", source: str = "", owner: str = "") -> list[dict]:
-        rows = [self._order_view(order) for order in self.store.list_orders() if order.owner_id == owner]
+        rows = []
+        for order in self.store.list_orders():
+            if order.owner_id != owner:
+                continue
+            self._refresh_availability(order)
+            rows.append(self._order_view(order))
         if status:
             rows = [row for row in rows if row["status"] == status]
         if source:
@@ -612,7 +711,7 @@ class WarehouseService:
         code = code.strip().upper()
         shelves = [item for item in self.store.list_locations() if item.owner_id == owner and item.block.upper() == code]
         for shelf in shelves:
-            self.store.delete_location(shelf.id)
+            self.delete_shelf(shelf.id, owner)
         self.store.delete_block_code(code, owner)
         return Result(True, "deleted", f"{code} bloğu silindi")
 
@@ -620,6 +719,11 @@ class WarehouseService:
         location = self.store.get_location(location_id)
         if location is None or location.owner_id != owner:
             return Result(False, "not_found", "Raf bulunamadı", 404)
+        for stock in self.store.list_stock():
+            if stock.location_id != location.id or stock.quantity <= 0:
+                continue
+            product = self.store.get_product(stock.product_id)
+            self._note_move(owner, product.product_name if product else "Ürün", location.block, location.shelf_code, -stock.quantity, "Raf silindi")
         self.store.delete_location(location_id)
         return Result(True, "deleted", f"{location_label(location.block, location.shelf_code)} silindi")
 
@@ -628,6 +732,8 @@ class WarehouseService:
         location = self.store.get_location(row.location_id) if row else None
         if row is None or location is None or location.owner_id != owner:
             return Result(False, "not_found", "Stok satırı bulunamadı", 404)
+        product = self.store.get_product(row.product_id)
+        self._note_move(owner, product.product_name if product else "Ürün", location.block, location.shelf_code, -row.quantity, "Raftan silme")
         self.store.delete_stock_row(stock_id)
         return Result(True, "deleted", "Ürün raftan silindi")
 
@@ -638,10 +744,14 @@ class WarehouseService:
         location = self.store.get_location(row.location_id) if row else None
         if row is None or location is None or location.owner_id != owner:
             return Result(False, "not_found", "Stok satırı bulunamadı", 404)
+        product = self.store.get_product(row.product_id)
+        name = product.product_name if product else "Ürün"
         if row.quantity + delta <= 0:
+            self._note_move(owner, name, location.block, location.shelf_code, -row.quantity, "Düzeltme")
             self.store.delete_stock_row(stock_id)
             return Result(True, "deleted", "Adet sıfırlandı, ürün raftan kalktı", data={"quantity": 0})
         new_qty = self.store.adjust_stock(row.product_id, row.location_id, delta, capacity_check=False)
+        self._note_move(owner, name, location.block, location.shelf_code, delta, "Rafa ekleme" if delta > 0 else "Düzeltme")
         return Result(True, "updated", f"Adet {new_qty}", data={"quantity": new_qty})
 
     def add_location(self, block: str, shelf_code: str, capacity: int | None = None, owner: str = "") -> Result:
@@ -688,6 +798,7 @@ class WarehouseService:
         def op():
             chosen = product or self._create_named_product(name)
             new_qty = self.store.adjust_stock(chosen.id, location.id, quantity, capacity_check=False)
+            self._note_move(owner, chosen.product_name, location.block, location.shelf_code, quantity, "Rafa ekleme")
             payload = {**data, "resulting_quantity": new_qty, "product_id": chosen.id}
             return Result(True, "added", summary, data=payload)
 
@@ -737,6 +848,49 @@ class WarehouseService:
                 return fn()
         except Leave as exc:
             return exc.result
+
+    def _bundle(self, order: Order) -> list[Order]:
+        rows = [
+            item
+            for item in self.store.list_orders_by_order_id(order.order_id)
+            if item.owner_id == order.owner_id and item.source == order.source and item.status != "iptal"
+        ]
+        rows.sort(key=lambda item: (item.created_at, item.id))
+        return rows or [order]
+
+    def _bundle_block(self, order: Order) -> str | None:
+        lines = self._bundle(order)
+        pending = [item for item in lines if item.status == "beklemede"]
+        open_lines = [item for item in pending if item.needs_manual_match or not item.matched_product_id]
+        if not open_lines:
+            return None
+        if len(lines) == 1:
+            return "Bu sipariş manuel ürün eşleştirmesi bekliyor"
+        return f"Bu siparişte {len(open_lines)} ürün seçilmedi. Hepsi seçilmeden onaylanmaz."
+
+    def _reopen_product_choice(self, order: Order) -> Result:
+        order.proposed_location_id = None
+        order.stock_note = "Stokta yok"
+        order.updated_at = now_iso()
+        self.store.save_order(order)
+        return Result(False, "insufficient_stock", "Stokta yok", 409, {"order": self._order_view(order)})
+
+    def _refresh_availability(self, order: Order) -> None:
+        if order.status != "beklemede" or order.needs_manual_match or not order.matched_product_id:
+            return
+        place, note = self._choose(order.matched_product_id, order.quantity, order.owner_id)
+        if place is not None and not note:
+            if order.proposed_location_id == place.id and not order.stock_note:
+                return
+            order.proposed_location_id = place.id
+            order.stock_note = None
+        else:
+            if order.proposed_location_id is None and order.stock_note == "Stokta yok":
+                return
+            order.proposed_location_id = None
+            order.stock_note = "Stokta yok"
+        order.updated_at = now_iso()
+        self.store.save_order(order)
 
     def _choose(self, product_id: str, quantity: int, owner: str = ""):
         spots = [spot for spot in self._positions(product_id, owner) if spot["active"] and spot["quantity"] > 0]

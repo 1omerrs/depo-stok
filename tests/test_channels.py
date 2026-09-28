@@ -102,6 +102,34 @@ def test_daily_summary_includes_pending_order(client):
     assert "N11-1" in rows[0]["body"]
 
 
+def test_marketplace_payloads_become_order_lines(monkeypatch):
+    from app.channels import pull_hepsiburada, pull_n11
+
+    calls = []
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def json(self):
+            return self.payload
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        calls.append(url)
+        if "hepsiburada" in url:
+            return Response({"items": [{"orderNumber": "HB-9", "productName": "Defter", "quantity": 2, "merchantSKU": "DEF"}]})
+        return Response({"content": [{"orderNumber": "N-9", "lines": [{"productName": "Kalem", "quantity": 1, "stockCode": "KAL", "barcode": "869"}]}]})
+
+    monkeypatch.setattr("app.channels.httpx.get", fake_get)
+    hb = pull_hepsiburada({"merchant_id": "m1", "service_key": "s1"})
+    n11 = pull_n11({"app_key": "k", "app_secret": "s"})
+    assert hb[0].order_id == "HB-9" and hb[0].sku == "DEF" and hb[0].source == "Hepsiburada"
+    assert n11[0].order_id == "N-9" and n11[0].sku == "KAL" and n11[0].barcode == "869"
+    assert len(calls) == 3
+
+
 def test_channel_rejects_missing_fields(client):
     http, _app = client
     _member(http)
@@ -112,4 +140,27 @@ def test_channel_rejects_missing_fields(client):
     assert amazon.json()["code"] == "stored"
     stored = http.post("/api/channels/hepsiburada", json={"merchant_id": "m1", "service_key": "k1"})
     assert stored.status_code == 200
-    assert stored.json()["code"] == "stored"
+    assert stored.json()["code"] == "connected"
+
+
+def test_hepsiburada_and_n11_orders_land(client, monkeypatch):
+    http, _app = client
+    _member(http)
+
+    def hepsiburada(secrets):
+        assert secrets["service_key"] == "servis"
+        return [IncomingLine(source="Hepsiburada", order_id="HB-1", product_name="Defter", quantity=2, external_key="hepsiburada|HB-1|DEF", sku="DEF")]
+
+    def n11(secrets):
+        assert secrets["app_secret"] == "gizli"
+        return [IncomingLine(source="n11", order_id="N-1", product_name="Kalem", quantity=1, external_key="n11|N-1|KAL", sku="KAL")]
+
+    monkeypatch.setattr("app.service.pull_hepsiburada", hepsiburada)
+    monkeypatch.setattr("app.service.pull_n11", n11)
+    assert http.post("/api/channels/hepsiburada", json={"merchant_id": "magaza", "service_key": "servis"}).status_code == 200
+    assert http.post("/api/channels/n11", json={"app_key": "anahtar", "app_secret": "gizli"}).status_code == 200
+    synced = http.post("/api/channels/sync")
+    assert synced.status_code == 200
+    assert synced.json()["data"]["imported"] == 2
+    orders = {row["order_id"] for row in http.get("/api/orders").json()["data"]["rows"]}
+    assert orders == {"HB-1", "N-1"}

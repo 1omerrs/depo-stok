@@ -328,6 +328,47 @@ th { font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase; color: 
   gap: 8px;
 }
 .shelf-tile .code { font-size: 1.45rem; font-weight: 750; letter-spacing: -0.03em; line-height: 1; color: #f6f1e8; }
+.stock-summary {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin: 0 0 22px;
+}
+.summary-card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  padding: 16px 18px 8px;
+  box-shadow: 0 10px 24px rgba(28, 25, 21, 0.04);
+}
+.summary-card header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 12px;
+}
+.summary-card h2 { font-size: 1.25rem; }
+.summary-card .total {
+  font-family: Fraunces, Georgia, serif;
+  font-size: 2.4rem;
+  font-weight: 560;
+  line-height: 0.9;
+  letter-spacing: -0.03em;
+}
+.summary-card.in .total { color: var(--green); }
+.summary-card.out .total { color: var(--red); }
+.move-list { list-style: none; margin: 12px 0 0; padding: 0; }
+.move-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0;
+  border-top: 1px solid var(--line);
+}
+.move-list strong, .move-list small, .move-qty { display: block; }
+.move-list small, .move-qty time { color: var(--muted); font-size: 12px; }
+.move-qty { text-align: right; }
+.move-qty b { font-variant-numeric: tabular-nums; }
 .shelf-panel { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
 .product-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
 .stock-line {
@@ -486,6 +527,66 @@ th { font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase; color: 
   border-radius: 18px;
   box-shadow: 0 12px 30px rgba(20, 18, 16, 0.28);
 }
+.order-stack { display: flex; flex-direction: column; gap: 16px; }
+.order-card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  overflow: hidden;
+  box-shadow: 0 12px 28px rgba(28, 25, 21, 0.05);
+}
+.order-card header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+  padding: 18px 20px 16px;
+  background: #221f1b;
+  color: #f6f1e8;
+}
+.order-card header .kicker { color: #b7aea0; }
+.order-card header h2 {
+  margin: 0;
+  font-family: Fraunces, Georgia, serif;
+  font-size: 1.85rem;
+  font-weight: 560;
+  letter-spacing: -0.03em;
+  color: #f6f1e8;
+}
+.order-lines { list-style: none; margin: 0; padding: 0; }
+.order-line { padding: 16px 20px 18px; border-top: 1px solid var(--line); }
+.line-top { display: grid; grid-template-columns: 36px minmax(0, 1fr) auto; gap: 12px; align-items: start; }
+.line-no {
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  padding-top: 4px;
+}
+.line-top strong { display: block; font-size: 1.02rem; }
+.line-top .muted { margin: 2px 0 0; font-size: 13px; }
+.qty-pill {
+  border-radius: 999px;
+  padding: 6px 10px;
+  background: #f3ecdf;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.line-note { margin: 12px 0 0; line-height: 1.45; }
+.order-line .flash { margin: 12px 0 0; }
+.order-line label { margin-top: 12px; }
+.order-line .actions { margin-top: 10px; }
+.order-foot {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 20px;
+  background: #faf7f1;
+  border-top: 1px solid var(--line);
+}
+.order-foot p { margin: 0; color: var(--muted); line-height: 1.4; }
 .channel-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px; margin: 0 0 16px; }
 .channel-tile {
   display: flex; flex-direction: column; align-items: flex-start; justify-content: space-between; gap: 18px;
@@ -533,6 +634,10 @@ body.busy button { opacity: 0.65; }
   .aisle { min-height: 220px; }
   .page-head, .toolbar, .channel-panel { align-items: stretch; }
   .channel-panel { grid-template-columns: 1fr; padding: 16px; }
+  .stock-summary { grid-template-columns: 1fr; }
+  .order-foot { align-items: stretch; flex-direction: column; }
+  .line-top { grid-template-columns: 28px minmax(0, 1fr); }
+  .qty-pill { grid-column: 2; justify-self: start; }
   .toolbar, .toolbar label { width: 100%; }
   thead { display: none; }
   table, tbody, tr, td { display: block; width: 100%; }

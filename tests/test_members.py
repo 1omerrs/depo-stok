@@ -190,3 +190,149 @@ def test_member_can_write_admin_and_admin_can_delete_member(client):
     http.post("/api/logout")
     blocked = http.post("/api/login", json={"username": "eda@ornek.com", "password": "gizli123"})
     assert blocked.status_code == 401
+
+
+def test_empty_product_keeps_the_choice_open(client):
+    http, _app = client
+    signup = http.post(
+        "/api/register",
+        json={"first_name": "Ada", "last_name": "Yilmaz", "email": "ada@ornek.com", "company_name": "Ada", "password": "gizli123"},
+    )
+    member_id = signup.json()["data"]["account"]["id"]
+    http.post(f"/api/members/{member_id}/approve")
+    http.post("/api/logout")
+    http.post("/api/login", json={"username": "ada@ornek.com", "password": "gizli123"})
+    shelf = http.post("/api/locations", json={"block": "A", "shelf_code": "1"}).json()["data"]["location"]["id"]
+    empty = http.post("/api/products", json={"sku": "BOS", "product_name": "Bos urun"}).json()["data"]["product"]["id"]
+    stocked = http.post("/api/products", json={"sku": "DOLU", "product_name": "Dolu urun"}).json()["data"]["product"]["id"]
+    http.post("/api/stock/add", json={"product_id": stocked, "location_id": shelf, "quantity": 3, "confirmed": True})
+    key = http.get("/api/me").json()["data"]["user"]["intake_key"]
+    created = http.post(f"/api/webhooks/in/{key}", json={"source": "Kendi sitem", "order_id": "SEC-1", "product_name": "bilinmeyen urun xyz", "quantity": 1})
+    order_id = created.json()["results"][0]["data"]["order"]["id"]
+    refused = http.post(f"/api/orders/{order_id}/match", json={"product_id": empty})
+    assert refused.status_code == 409
+    still = http.get("/api/orders").json()["data"]["rows"][0]
+    assert still["needs_manual_match"] is True
+    assert "Başka bir ürün seçin" in still["stock_note"]
+    matched = http.post(f"/api/orders/{order_id}/match", json={"product_id": stocked})
+    assert matched.status_code == 200
+    assert matched.json()["data"]["order"]["needs_manual_match"] is False
+    stock_id = http.get("/api/stock").json()["data"]["rows"][0]["stock_id"]
+    for _ in range(3):
+        http.post(f"/api/stock/{stock_id}/adjust", json={"delta": -1})
+    blocked = http.post(f"/api/orders/{order_id}/approve", json={})
+    assert blocked.status_code == 409
+    assert blocked.json()["message"] == "Stokta yok"
+    reopened = http.get("/api/orders").json()["data"]["rows"][0]
+    assert reopened["needs_manual_match"] is False
+    assert reopened["stock_note"] == "Stokta yok"
+    assert reopened["location_label"] is None
+    assert reopened["status"] == "beklemede"
+
+
+def test_one_order_waits_until_every_line_is_chosen(client):
+    http, _app = client
+    signup = http.post(
+        "/api/register",
+        json={"first_name": "Eda", "last_name": "Demir", "email": "eda.demir@ornek.com", "company_name": "Demir", "password": "gizli123"},
+    )
+    member_id = signup.json()["data"]["account"]["id"]
+    http.post(f"/api/members/{member_id}/approve")
+    http.post("/api/logout")
+    http.post("/api/login", json={"username": "eda.demir@ornek.com", "password": "gizli123"})
+    shelf = http.post("/api/locations", json={"block": "D", "shelf_code": "2"}).json()["data"]["location"]["id"]
+    product = http.post("/api/products", json={"sku": "KALEM", "product_name": "Kalem"}).json()["data"]["product"]["id"]
+    http.post("/api/stock/add", json={"product_id": product, "location_id": shelf, "quantity": 5, "confirmed": True})
+    key = http.get("/api/me").json()["data"]["user"]["intake_key"]
+    bundled = http.post(
+        f"/api/webhooks/in/{key}",
+        json={
+            "source": "Kendi sitem",
+            "order_id": "GRP-1",
+            "items": [
+                {"product_name": "bilinmeyen aaa", "quantity": 1, "sku": "X1"},
+                {"product_name": "bilinmeyen bbb", "quantity": 1, "sku": "X2"},
+                {"product_name": "bilinmeyen ccc", "quantity": 1, "sku": "X3"},
+            ],
+        },
+    )
+    assert bundled.status_code == 201
+    lines = [item["data"]["order"] for item in bundled.json()["results"]]
+    assert len(lines) == 3
+    assert {item["order_id"] for item in lines} == {"GRP-1"}
+    refused = http.post(f"/api/orders/{lines[0]['id']}/approve", json={})
+    assert refused.status_code == 409
+    assert "seçilmeden onaylanmaz" in refused.json()["message"]
+    solo = http.post(
+        f"/api/webhooks/in/{key}",
+        json={"source": "Kendi sitem", "order_id": "SOLO-1", "product_name": "Kalem", "quantity": 1, "sku": "KALEM"},
+    )
+    solo_id = solo.json()["results"][0]["data"]["order"]["id"]
+    assert http.post(f"/api/orders/{solo_id}/approve", json={}).status_code == 200
+    for line in lines:
+        assert http.post(f"/api/orders/{line['id']}/match", json={"product_id": product}).status_code == 200
+    done = http.post(f"/api/orders/{lines[0]['id']}/approve", json={})
+    assert done.status_code == 200
+    assert "3 ürün" in done.json()["message"]
+    stored = [row for row in http.get("/api/orders").json()["data"]["rows"] if row["order_id"] == "GRP-1"]
+    assert [row["status"] for row in stored] == ["tamamlandı", "tamamlandı", "tamamlandı"]
+    assert http.get("/api/stock").json()["data"]["rows"][0]["quantity"] == 1
+
+
+def test_stock_summary_shows_entries_and_exits(client):
+    http, _app = client
+    signup = http.post(
+        "/api/register",
+        json={"first_name": "Naz", "last_name": "Acar", "email": "naz@ornek.com", "company_name": "Acar", "password": "gizli123"},
+    )
+    member_id = signup.json()["data"]["account"]["id"]
+    http.post(f"/api/members/{member_id}/approve")
+    http.post("/api/logout")
+    http.post("/api/login", json={"username": "naz@ornek.com", "password": "gizli123"})
+    shelf = http.post("/api/locations", json={"block": "N", "shelf_code": "4"}).json()["data"]["location"]["id"]
+    product = http.post("/api/products", json={"sku": "NAZ-1", "product_name": "Defter"}).json()["data"]["product"]["id"]
+    http.post("/api/stock/add", json={"product_id": product, "location_id": shelf, "quantity": 4, "confirmed": True})
+    added = http.get("/api/stock").json()["data"]["summary"]
+    assert added["in_total"] == 4
+    assert added["out_total"] == 0
+    assert added["entries"][0]["product_name"] == "Defter"
+    assert added["entries"][0]["reason"] == "Rafa ekleme"
+    key = http.get("/api/me").json()["data"]["user"]["intake_key"]
+    created = http.post(
+        f"/api/webhooks/in/{key}",
+        json={"source": "Kendi sitem", "order_id": "NAZ-9", "product_name": "Defter", "quantity": 1, "sku": "NAZ-1"},
+    )
+    order_id = created.json()["results"][0]["data"]["order"]["id"]
+    assert http.post(f"/api/orders/{order_id}/approve", json={}).status_code == 200
+    summary = http.get("/api/stock").json()["data"]["summary"]
+    assert summary["in_total"] == 4
+    assert summary["out_total"] == 1
+    assert summary["exits"][0]["reason"] == "Sipariş NAZ-9"
+    assert summary["exits"][0]["quantity"] == 1
+
+
+def test_order_sees_stock_added_later(client):
+    http, _app = client
+    signup = http.post(
+        "/api/register",
+        json={"first_name": "Nil", "last_name": "Ak", "email": "nil@ornek.com", "company_name": "Ak", "password": "gizli123"},
+    )
+    member_id = signup.json()["data"]["account"]["id"]
+    http.post(f"/api/members/{member_id}/approve")
+    http.post("/api/logout")
+    http.post("/api/login", json={"username": "nil@ornek.com", "password": "gizli123"})
+    http.post("/api/locations", json={"block": "A", "shelf_code": "100"})
+    http.post("/api/products", json={"sku": "TERMOS-2", "product_name": "Kirmizi termos"})
+    key = http.get("/api/me").json()["data"]["user"]["intake_key"]
+    created = http.post(
+        f"/api/webhooks/in/{key}",
+        json={"source": "Kendi sitem", "order_id": "AYSE-2", "product_name": "Kirmizi termos", "quantity": 1, "sku": "TERMOS-2"},
+    )
+    order = created.json()["results"][0]["data"]["order"]
+    assert order["location_label"] is None
+    assert order["stock_note"] == "Stokta yok"
+    http.post("/api/stock/place", json={"product_name": "Kirmizi termos", "block": "A", "shelf_code": "100", "quantity": 18, "confirmed": True})
+    refreshed = http.get("/api/orders").json()["data"]["rows"][0]
+    assert refreshed["stock_note"] is None
+    assert refreshed["location_label"]
+    assert refreshed["status"] == "beklemede"
