@@ -428,3 +428,12 @@ class AirtableStore:
         if item.original_order_id:
             fields["original_order"] = [item.original_order_id]
         return fields
+
+    def add_stock_move(self, owner_id: str, product_name: str, block: str, shelf_code: str, delta: int, reason: str, ref: str = "", created_at: str = "") -> None:
+        return None
+
+    def list_stock_moves(self, owner_id: str, since: str) -> list[dict]:
+        return []
+
+    def list_move_refs(self, owner_id: str) -> set[str]:
+        return set()

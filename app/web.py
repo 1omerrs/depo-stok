@@ -300,7 +300,9 @@ def me(request: Request):
 @router.get("/api/stock")
 def stock(request: Request, q: str = "", block: str = ""):
     _require_user(request)
-    return {"ok": True, "data": {"rows": _service(request).list_stock(q, block, _owner(request))}}
+    service = _service(request)
+    owner = _owner(request)
+    return {"ok": True, "data": {"rows": service.list_stock(q, block, owner), "summary": service.stock_summary(owner)}}
 
 
 @router.get("/api/channels")
